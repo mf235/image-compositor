@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
-APP_REV = "v30"
+APP_REV = "v31"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -752,6 +752,16 @@ class LoupeView(QWidget):
 
     def sizeHint(self):
         return QSize(220, 160)
+
+    def image_point_to_view_fast(self, p, scale=None):
+        if p is None or self.center is None:
+            return None
+        if scale is None:
+            scale = self.get_current_scale()
+        return QPointF(
+            self.width() / 2.0 + (p.x() - self.center.x()) * scale,
+            self.height() / 2.0 + (p.y() - self.center.y()) * scale,
+        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1501,22 +1511,33 @@ class WarpEditorCanvas(QWidget):
             return
 
         self.ensure_center()
+        if self.center is None:
+            return
         scale = self.get_current_scale()
-        qimg = bgra_to_qimage(img)
-        pix = QPixmap.fromImage(qimg)
-        target = QRectF(
-            self.width() / 2.0 - self.center.x() * scale,
-            self.height() / 2.0 - self.center.y() * scale,
-            pix.width() * scale,
-            pix.height() * scale,
-        )
-        painter.drawPixmap(target, pix, QRectF(pix.rect()))
+        h, w = img.shape[:2]
 
-        view_points = []
-        for idx in range(WARP_GRID_ROWS * WARP_GRID_COLS):
-            p = self.dialog.control_point_image_pos(idx)
-            vp = self.image_to_view(p) if p is not None else None
-            view_points.append(vp)
+        view_w_img = self.width() / max(scale, 1e-6)
+        view_h_img = self.height() / max(scale, 1e-6)
+        x0_f = self.center.x() - view_w_img / 2.0
+        y0_f = self.center.y() - view_h_img / 2.0
+        x1_f = self.center.x() + view_w_img / 2.0
+        y1_f = self.center.y() + view_h_img / 2.0
+
+        x0 = max(0, int(math.floor(x0_f)))
+        y0 = max(0, int(math.floor(y0_f)))
+        x1 = min(w, int(math.ceil(x1_f)))
+        y1 = min(h, int(math.ceil(y1_f)))
+        if x1 > x0 and y1 > y0:
+            crop = img[y0:y1, x0:x1]
+            pix = QPixmap.fromImage(bgra_to_qimage(crop))
+            target_x = self.width() / 2.0 - (self.center.x() - x0) * scale
+            target_y = self.height() / 2.0 - (self.center.y() - y0) * scale
+            target_w = (x1 - x0) * scale
+            target_h = (y1 - y0) * scale
+            painter.drawPixmap(QRectF(target_x, target_y, target_w, target_h), pix, QRectF(pix.rect()))
+
+        control_points = self.dialog.control_points_image_pos()
+        view_points = [self.image_point_to_view_fast(p, scale) for p in control_points]
 
         if self.dialog.show_warp_overlay:
             pen_line = QPen(QColor(80, 210, 255), 1, Qt.SolidLine)
@@ -1556,11 +1577,14 @@ class WarpEditorCanvas(QWidget):
     def nearest_control_point(self, pos):
         if not self.dialog.show_warp_overlay:
             return None
+        self.ensure_center()
+        if self.center is None:
+            return None
+        scale = self.get_current_scale()
         best_idx = None
         best_dist = 10.0
-        for idx in range(WARP_GRID_ROWS * WARP_GRID_COLS):
-            p = self.dialog.control_point_image_pos(idx)
-            vp = self.image_to_view(p) if p is not None else None
+        for idx, p in enumerate(self.dialog.control_points_image_pos()):
+            vp = self.image_point_to_view_fast(p, scale)
             if vp is None:
                 continue
             dx = vp.x() - pos.x()
@@ -1616,11 +1640,6 @@ class WarpEditorCanvas(QWidget):
             event.accept()
             return
 
-        hover_index = self.nearest_control_point(event.pos())
-        if hover_index != self.focus_index:
-            self.focus_index = hover_index
-            self.update()
-
         if self.dragging_item:
             image_pos = self.view_to_image(event.pos())
             if image_pos is not None and self.drag_last_image_pos is not None:
@@ -1643,6 +1662,11 @@ class WarpEditorCanvas(QWidget):
             self.update()
             event.accept()
             return
+
+        hover_index = self.nearest_control_point(event.pos())
+        if hover_index != self.focus_index:
+            self.focus_index = hover_index
+            self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -1701,6 +1725,8 @@ class WarpDialog(QDialog):
         self.show_warp_overlay = True
         self._preview_cache = None
         self._preview_cache_key = None
+        self._geometry_cache = None
+        self._geometry_cache_key = None
 
         layout = QVBoxLayout(self)
         self.canvas = WarpEditorCanvas(self)
@@ -1765,6 +1791,8 @@ class WarpDialog(QDialog):
     def invalidate_preview(self):
         self._preview_cache = None
         self._preview_cache_key = None
+        self._geometry_cache = None
+        self._geometry_cache_key = None
 
     def preview_image(self):
         base = self.main_window.base_image
@@ -1789,27 +1817,49 @@ class WarpDialog(QDialog):
         return self.main_window.render_item_pre_warp(self.draft_item(), self.main_window.base_image)
 
     def warp_display_geometry(self):
+        draft = self.draft_item()
+        key = (
+            round(float(draft.get("x", 0.0)), 3),
+            round(float(draft.get("y", 0.0)), 3),
+            bool(draft.get("rotation_enabled", False)),
+            round(float(draft.get("rotation", 0.0)), 3),
+            tuple((round(x, 4), round(y, 4)) for x, y in self.points),
+        )
+        if self._geometry_cache is not None and key == self._geometry_cache_key:
+            return self._geometry_cache
+
         pre = self.pre_warp_image()
         if pre is None:
+            self._geometry_cache = None
+            self._geometry_cache_key = None
             return None
         h, w = pre.shape[:2]
         geom = warp_geometry(w, h, self.points)
-        draft = self.draft_item()
         angle = float(draft.get("rotation", 0.0)) if bool(draft.get("rotation_enabled", False)) else 0.0
         matrix, final_w, final_h = rotation_matrix_for_image(geom["out_w"], geom["out_h"], angle)
         left = float(draft.get("x", 0.0)) - final_w / 2.0
         top = float(draft.get("y", 0.0)) - final_h / 2.0
-        return pre.shape, geom, matrix, final_w, final_h, left, top
+        self._geometry_cache = (pre.shape, geom, matrix, final_w, final_h, left, top)
+        self._geometry_cache_key = key
+        return self._geometry_cache
 
-    def control_point_image_pos(self, idx):
+    def control_points_image_pos(self):
         data = self.warp_display_geometry()
         if data is None:
-            return None
+            return []
         _, geom, matrix, _, _, left, top = data
-        p = geom["shifted_dst_pts"][idx]
-        rx = float(matrix[0, 0] * p[0] + matrix[0, 1] * p[1] + matrix[0, 2])
-        ry = float(matrix[1, 0] * p[0] + matrix[1, 1] * p[1] + matrix[1, 2])
-        return QPointF(left + rx, top + ry)
+        pts = []
+        for p in geom["shifted_dst_pts"]:
+            rx = float(matrix[0, 0] * p[0] + matrix[0, 1] * p[1] + matrix[0, 2])
+            ry = float(matrix[1, 0] * p[0] + matrix[1, 1] * p[1] + matrix[1, 2])
+            pts.append(QPointF(left + rx, top + ry))
+        return pts
+
+    def control_point_image_pos(self, idx):
+        pts = self.control_points_image_pos()
+        if idx < 0 or idx >= len(pts):
+            return None
+        return pts[idx]
 
     def set_dragged_point_from_image(self, idx, image_pos):
         if image_pos is None:
@@ -1832,12 +1882,15 @@ class WarpDialog(QDialog):
         self.invalidate_preview()
 
     def outer_polygon_image(self):
-        corners = []
-        for idx in (0, WARP_GRID_COLS - 1, WARP_GRID_ROWS * WARP_GRID_COLS - 1, WARP_GRID_COLS * (WARP_GRID_ROWS - 1)):
-            p = self.control_point_image_pos(idx)
-            if p is None:
-                return None
-            corners.append(p)
+        pts = self.control_points_image_pos()
+        if len(pts) < WARP_GRID_ROWS * WARP_GRID_COLS:
+            return None
+        corners = [
+            pts[0],
+            pts[WARP_GRID_COLS - 1],
+            pts[WARP_GRID_ROWS * WARP_GRID_COLS - 1],
+            pts[WARP_GRID_COLS * (WARP_GRID_ROWS - 1)],
+        ]
         return QPolygonF(corners)
 
     def point_hits_item(self, image_pos):
