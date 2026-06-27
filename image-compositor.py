@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
-APP_REV = "v32"
+APP_REV = "v33"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -286,6 +286,45 @@ def resize_image(src_bgra, scale_w: float, scale_h: float = None):
     nh = max(1, int(round(h * scale_h)))
     # 画質優先。縮小・拡大とも Bicubic に統一する。
     return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
+
+
+def crop_image(src_bgra, top=0, bottom=0, left=0, right=0):
+    img = ensure_bgra(src_bgra)
+    h, w = img.shape[:2]
+    top = max(0, int(top))
+    bottom = max(0, int(bottom))
+    left = max(0, int(left))
+    right = max(0, int(right))
+    # 全部削り切る指定は避け、最低1pxは残す。
+    if left + right >= w:
+        if left >= w:
+            left = w - 1
+            right = 0
+        else:
+            right = max(0, w - left - 1)
+    if top + bottom >= h:
+        if top >= h:
+            top = h - 1
+            bottom = 0
+        else:
+            bottom = max(0, h - top - 1)
+    x1 = left
+    y1 = top
+    x2 = w - right
+    y2 = h - bottom
+    return img[y1:y2, x1:x2].copy()
+
+
+def crop_item_image(src_bgra, item):
+    if not bool(item.get("crop_enabled", False)):
+        return ensure_bgra(src_bgra)
+    return crop_image(
+        src_bgra,
+        int(item.get("crop_top", 0)),
+        int(item.get("crop_bottom", 0)),
+        int(item.get("crop_left", 0)),
+        int(item.get("crop_right", 0)),
+    )
 
 
 def rotate_image(src_bgra, angle_degrees: float):
@@ -1240,6 +1279,7 @@ class CanvasWidget(QWidget):
         part = self.main_window.get_part_image(item.get("part_id"))
         if part is None:
             return None
+        part = crop_item_image(part, item)
         h, w = part.shape[:2]
         scale_w = item_scale_w(item)
         scale_h = item_scale_h(item)
@@ -2080,6 +2120,46 @@ class ImageCompositor(QMainWindow):
         settings_form = QVBoxLayout(settings_inner)
         settings_form.setContentsMargins(4, 4, 4, 4)
 
+        # 切り抜き
+        crop_box = QGroupBox("切り抜き")
+        crop_box.setCheckable(True)
+        crop_box.setChecked(False)
+        crop_box.toggled.connect(self.controls_to_item)
+        self.crop_check = crop_box
+        crop_form = QFormLayout(crop_box)
+        crop_row = QWidget()
+        crop_row_layout = QHBoxLayout(crop_row)
+        crop_row_layout.setContentsMargins(0, 0, 0, 0)
+        crop_row_layout.setSpacing(6)
+
+        self.crop_top_spin = QSpinBox()
+        self.crop_top_spin.setRange(0, 10000)
+        self.crop_top_spin.setValue(0)
+        self.crop_top_spin.valueChanged.connect(self.controls_to_item)
+        self.crop_bottom_spin = QSpinBox()
+        self.crop_bottom_spin.setRange(0, 10000)
+        self.crop_bottom_spin.setValue(0)
+        self.crop_bottom_spin.valueChanged.connect(self.controls_to_item)
+        self.crop_left_spin = QSpinBox()
+        self.crop_left_spin.setRange(0, 10000)
+        self.crop_left_spin.setValue(0)
+        self.crop_left_spin.valueChanged.connect(self.controls_to_item)
+        self.crop_right_spin = QSpinBox()
+        self.crop_right_spin.setRange(0, 10000)
+        self.crop_right_spin.setValue(0)
+        self.crop_right_spin.valueChanged.connect(self.controls_to_item)
+
+        crop_row_layout.addWidget(QLabel("上"))
+        crop_row_layout.addWidget(self.crop_top_spin, 1)
+        crop_row_layout.addWidget(QLabel("下"))
+        crop_row_layout.addWidget(self.crop_bottom_spin, 1)
+        crop_row_layout.addWidget(QLabel("左"))
+        crop_row_layout.addWidget(self.crop_left_spin, 1)
+        crop_row_layout.addWidget(QLabel("右"))
+        crop_row_layout.addWidget(self.crop_right_spin, 1)
+        crop_form.addRow("px", crop_row)
+        settings_form.addWidget(crop_box)
+
         # サイズ
         scale_box = QGroupBox("サイズ")
         scale_form = QFormLayout(scale_box)
@@ -2396,6 +2476,11 @@ class ImageCompositor(QMainWindow):
             "x": float(x),
             "y": float(y),
             "visible": True,
+            "crop_enabled": bool(self.crop_check.isChecked()),
+            "crop_top": int(self.crop_top_spin.value()),
+            "crop_bottom": int(self.crop_bottom_spin.value()),
+            "crop_left": int(self.crop_left_spin.value()),
+            "crop_right": int(self.crop_right_spin.value()),
             "scale": float(self.scale_w_spin.value()),
             "scale_w": float(self.scale_w_spin.value()),
             "scale_h": float(self.scale_h_spin.value()),
@@ -2988,6 +3073,7 @@ class ImageCompositor(QMainWindow):
             part = self.get_part_image(item.get("part_id"))
             if part is None:
                 continue
+            part = crop_item_image(part, item)
             h, w = part.shape[:2]
             scale_w = max(0.02, item_scale_w(item))
             scale_h = max(0.02, item_scale_h(item))
@@ -3011,6 +3097,11 @@ class ImageCompositor(QMainWindow):
         self.loading_ui = True
         enabled = item is not None
         controls = [
+            self.crop_check,
+            self.crop_top_spin,
+            self.crop_bottom_spin,
+            self.crop_left_spin,
+            self.crop_right_spin,
             self.scale_w_spin,
             self.scale_h_spin,
             self.scale_lock_check,
@@ -3040,6 +3131,11 @@ class ImageCompositor(QMainWindow):
         for c in controls:
             c.setEnabled(enabled)
         if item:
+            self.crop_check.setChecked(bool(item.get("crop_enabled", False)))
+            self.crop_top_spin.setValue(int(item.get("crop_top", 0)))
+            self.crop_bottom_spin.setValue(int(item.get("crop_bottom", 0)))
+            self.crop_left_spin.setValue(int(item.get("crop_left", 0)))
+            self.crop_right_spin.setValue(int(item.get("crop_right", 0)))
             scale_w = item_scale_w(item)
             scale_h = item_scale_h(item)
             scale_lock = bool(item.get("scale_lock", True))
@@ -3082,6 +3178,11 @@ class ImageCompositor(QMainWindow):
         item = self.selected_item()
         if item is None:
             return
+        item["crop_enabled"] = bool(self.crop_check.isChecked())
+        item["crop_top"] = int(self.crop_top_spin.value())
+        item["crop_bottom"] = int(self.crop_bottom_spin.value())
+        item["crop_left"] = int(self.crop_left_spin.value())
+        item["crop_right"] = int(self.crop_right_spin.value())
         item["scale"] = float(self.scale_w_spin.value())
         item["scale_w"] = float(self.scale_w_spin.value())
         item["scale_h"] = float(self.scale_h_spin.value())
@@ -3234,7 +3335,7 @@ class ImageCompositor(QMainWindow):
         part = self.get_part_image(item.get("part_id"))
         if part is None:
             return None
-        img = part.copy()
+        img = crop_item_image(part, item)
 
         if apply_color and bool(item.get("color_enabled", False)):
             if item.get("color_target", "local") == "local":
