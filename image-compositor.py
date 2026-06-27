@@ -801,9 +801,9 @@ class LoupeView(QWidget):
         zoom = max(1.0, self.main_window.loupe_slider.value() / 100.0)
         dx = (event.pos().x() - self.drag_start_widget_pos.x()) / zoom
         dy = (event.pos().y() - self.drag_start_widget_pos.y()) / zoom
-        # ルーペ上でドラッグした方向へ、確認位置をそのまま動かす。
-        nx = max(0.0, min(float(w - 1), self.drag_start_image_pos.x() + dx))
-        ny = max(0.0, min(float(h - 1), self.drag_start_image_pos.y() + dy))
+        # 画像ビューの手のひら移動に合わせる。ドラッグした方向へ表示が動くよう、参照位置は逆へずらす。
+        nx = max(0.0, min(float(w - 1), self.drag_start_image_pos.x() - dx))
+        ny = max(0.0, min(float(h - 1), self.drag_start_image_pos.y() - dy))
         self.main_window.update_loupe_position(QPointF(nx, ny))
 
     def mouseReleaseEvent(self, event):
@@ -851,12 +851,14 @@ class LoupeToolWindow(QWidget):
         super().showEvent(event)
         self.raise_()
         if hasattr(self.main_window, "sync_view_buttons"):
-            self.main_window.sync_view_buttons(save=True)
+            save = not getattr(self.main_window, "loading_ui", False) and not getattr(self.main_window, "_closing_app", False)
+            self.main_window.sync_view_buttons(save=save)
 
     def hideEvent(self, event):
         super().hideEvent(event)
         if hasattr(self.main_window, "sync_view_buttons"):
-            self.main_window.sync_view_buttons(save=True)
+            save = not getattr(self.main_window, "loading_ui", False) and not getattr(self.main_window, "_closing_app", False)
+            self.main_window.sync_view_buttons(save=save)
 
     def closeEvent(self, event):
         super().closeEvent(event)
@@ -1167,6 +1169,9 @@ class CanvasWidget(QWidget):
 
 
 class WarpEditorCanvas(QWidget):
+    MIN_ZOOM = 0.05
+    MAX_ZOOM = 20.0
+
     def __init__(self, dialog):
         super().__init__()
         self.dialog = dialog
@@ -1174,28 +1179,125 @@ class WarpEditorCanvas(QWidget):
         self.setMouseTracking(True)
         self.display_rect = QRect()
         self.drag_index = None
+        self.panning = False
+        self.pan_last_pos = None
+        self.zoom_scale = 1.0
+        self.center = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.setStyleSheet("background-color: #202020;")
 
-    def image_to_view(self, p: QPointF):
-        base = self.dialog.main_window.base_image
-        if base is None or self.display_rect.isNull():
+    def preview_shape(self):
+        img = self.dialog.preview_image()
+        if img is None:
             return None
-        h, w = base.shape[:2]
+        return img.shape[:2]
+
+    def ensure_center(self):
+        shape = self.preview_shape()
+        if shape is None:
+            self.center = None
+            return
+        h, w = shape
+        if self.center is None:
+            self.center = QPointF(w / 2.0, h / 2.0)
+        self.clamp_center()
+
+    def get_fit_scale(self):
+        shape = self.preview_shape()
+        if shape is None:
+            return 1.0
+        h, w = shape
+        area_w = max(1, self.width() - 8)
+        area_h = max(1, self.height() - 8)
+        return max(self.MIN_ZOOM, min(area_w / max(1, w), area_h / max(1, h)))
+
+    def get_current_scale(self):
+        return max(self.MIN_ZOOM, min(self.MAX_ZOOM, self.get_fit_scale() * self.zoom_scale))
+
+    def clamp_center(self):
+        shape = self.preview_shape()
+        if shape is None or self.center is None:
+            return
+        h, w = shape
+        scale = self.get_current_scale()
+        view_w = self.width() / max(scale, 1e-6)
+        view_h = self.height() / max(scale, 1e-6)
+
+        if view_w >= w:
+            cx = w / 2.0
+        else:
+            half = view_w / 2.0
+            cx = min(max(self.center.x(), half), w - half)
+
+        if view_h >= h:
+            cy = h / 2.0
+        else:
+            half = view_h / 2.0
+            cy = min(max(self.center.y(), half), h - half)
+
+        self.center = QPointF(cx, cy)
+
+    def image_to_view(self, p: QPointF):
+        shape = self.preview_shape()
+        if shape is None:
+            return None
+        self.ensure_center()
+        if self.center is None:
+            return None
+        scale = self.get_current_scale()
         return QPointF(
-            self.display_rect.left() + p.x() * self.display_rect.width() / float(w),
-            self.display_rect.top() + p.y() * self.display_rect.height() / float(h),
+            self.width() / 2.0 + (p.x() - self.center.x()) * scale,
+            self.height() / 2.0 + (p.y() - self.center.y()) * scale,
         )
 
     def view_to_image(self, p: QPoint):
-        base = self.dialog.main_window.base_image
-        if base is None or self.display_rect.isNull() or not self.display_rect.contains(p):
+        shape = self.preview_shape()
+        if shape is None:
             return None
-        h, w = base.shape[:2]
-        return QPointF(
-            (p.x() - self.display_rect.left()) * w / float(self.display_rect.width()),
-            (p.y() - self.display_rect.top()) * h / float(self.display_rect.height()),
-        )
+        self.ensure_center()
+        if self.center is None:
+            return None
+        h, w = shape
+        scale = self.get_current_scale()
+        ix = self.center.x() + (p.x() - self.width() / 2.0) / max(scale, 1e-6)
+        iy = self.center.y() + (p.y() - self.height() / 2.0) / max(scale, 1e-6)
+        if ix < 0 or iy < 0 or ix >= w or iy >= h:
+            return None
+        return QPointF(ix, iy)
+
+    def set_zoom(self, new_zoom_scale, anchor_pos=None):
+        shape = self.preview_shape()
+        if shape is None:
+            return
+        self.ensure_center()
+        old_scale = self.get_current_scale()
+        if anchor_pos is not None and self.center is not None:
+            anchor_img = QPointF(
+                self.center.x() + (anchor_pos.x() - self.width() / 2.0) / max(old_scale, 1e-6),
+                self.center.y() + (anchor_pos.y() - self.height() / 2.0) / max(old_scale, 1e-6),
+            )
+        else:
+            anchor_img = None
+
+        self.zoom_scale = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(new_zoom_scale)))
+        new_scale = self.get_current_scale()
+        if anchor_img is not None:
+            self.center = QPointF(
+                anchor_img.x() - (anchor_pos.x() - self.width() / 2.0) / max(new_scale, 1e-6),
+                anchor_img.y() - (anchor_pos.y() - self.height() / 2.0) / max(new_scale, 1e-6),
+            )
+        self.clamp_center()
+        self.update()
+
+    def reset_view(self):
+        self.zoom_scale = 1.0
+        self.center = None
+        self.ensure_center()
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.clamp_center()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1208,13 +1310,17 @@ class WarpEditorCanvas(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "プレビューを作成できません")
             return
 
+        self.ensure_center()
+        scale = self.get_current_scale()
         qimg = bgra_to_qimage(img)
         pix = QPixmap.fromImage(qimg)
-        scaled = pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        x = (self.width() - scaled.width()) // 2
-        y = (self.height() - scaled.height()) // 2
-        self.display_rect = QRect(x, y, scaled.width(), scaled.height())
-        painter.drawPixmap(x, y, scaled)
+        target = QRectF(
+            self.width() / 2.0 - self.center.x() * scale,
+            self.height() / 2.0 - self.center.y() * scale,
+            pix.width() * scale,
+            pix.height() * scale,
+        )
+        painter.drawPixmap(target, pix, QRectF(pix.rect()))
 
         view_points = []
         for idx in range(WARP_GRID_ROWS * WARP_GRID_COLS):
@@ -1241,18 +1347,18 @@ class WarpEditorCanvas(QWidget):
             if vp is None:
                 continue
             selected = idx == self.drag_index
-            radius = 6 if selected else 5
+            radius = 4 if selected else 3
             color = QColor(255, 230, 80) if selected else QColor(80, 210, 255)
-            painter.setPen(QPen(QColor(20, 20, 20), 2))
+            painter.setPen(QPen(QColor(15, 15, 15), 1))
             painter.setBrush(color)
             painter.drawEllipse(vp, radius, radius)
 
         painter.setPen(QColor(230, 230, 230))
-        painter.drawText(10, self.height() - 12, "制御点をドラッグ / R:リセット / Enter:適用 / Esc:キャンセル")
+        painter.drawText(10, self.height() - 12, "制御点をドラッグ / ホイール:拡大縮小 / 空白ドラッグ:表示移動 / R:リセット / Enter:適用 / Esc:キャンセル")
 
     def nearest_control_point(self, pos):
         best_idx = None
-        best_dist = 14.0
+        best_dist = 10.0
         for idx in range(WARP_GRID_ROWS * WARP_GRID_COLS):
             p = self.dialog.control_point_image_pos(idx)
             vp = self.image_to_view(p) if p is not None else None
@@ -1266,6 +1372,15 @@ class WarpEditorCanvas(QWidget):
                 best_idx = idx
         return best_idx
 
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0:
+            event.ignore()
+            return
+        factor = 1.25 ** steps
+        self.set_zoom(self.zoom_scale * factor, anchor_pos=event.pos())
+        event.accept()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             idx = self.nearest_control_point(event.pos())
@@ -1275,11 +1390,28 @@ class WarpEditorCanvas(QWidget):
                 self.update()
                 event.accept()
                 return
+            self.panning = True
+            self.pan_last_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self.drag_index is not None:
             self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
+            self.update()
+            event.accept()
+            return
+        if self.panning and self.pan_last_pos is not None and self.center is not None:
+            scale = self.get_current_scale()
+            delta = event.pos() - self.pan_last_pos
+            self.center = QPointF(
+                self.center.x() - delta.x() / max(scale, 1e-6),
+                self.center.y() - delta.y() / max(scale, 1e-6),
+            )
+            self.pan_last_pos = event.pos()
+            self.clamp_center()
             self.update()
             event.accept()
             return
@@ -1290,6 +1422,12 @@ class WarpEditorCanvas(QWidget):
             self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
             self.drag_index = None
             self.update()
+            event.accept()
+            return
+        if self.panning:
+            self.panning = False
+            self.pan_last_pos = None
+            self.unsetCursor()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -1466,6 +1604,7 @@ class ImageCompositor(QMainWindow):
         self.drag_item_pixmap = None
         self.placed_list_pressed = False
         self.always_show_frames = False
+        self._closing_app = False
 
         self.build_ui()
         self.load_settings()
@@ -2013,6 +2152,7 @@ class ImageCompositor(QMainWindow):
             print(f"settings save error: {exc}")
 
     def closeEvent(self, event):
+        self._closing_app = True
         self.save_settings()
         super().closeEvent(event)
 
