@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
-APP_REV = "v26"
+APP_REV = "v27"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -1537,7 +1537,7 @@ class WarpEditorCanvas(QWidget):
             painter.drawEllipse(vp, radius, radius)
 
         painter.setPen(QColor(230, 230, 230))
-        painter.drawText(10, self.height() - 12, "点:左ドラッグ / 素材移動:左ドラッグ / 表示移動:右ドラッグ / ホイール:拡大縮小 / R:リセット / Enter:適用 / Esc:キャンセル")
+        painter.drawText(10, self.height() - 12, "点:左ドラッグ / 線の内側:左ドラッグで素材移動 / 右ドラッグ:表示移動 / ホイール:拡大縮小 / R:リセット / Enter:適用 / Esc:キャンセル")
 
     def nearest_control_point(self, pos):
         best_idx = None
@@ -1736,10 +1736,11 @@ class WarpDialog(QDialog):
             return None
         h, w = pre.shape[:2]
         geom = warp_geometry(w, h, self.points)
-        angle = float(self.item().get("rotation", 0.0)) if bool(self.item().get("rotation_enabled", False)) else 0.0
+        draft = self.draft_item()
+        angle = float(draft.get("rotation", 0.0)) if bool(draft.get("rotation_enabled", False)) else 0.0
         matrix, final_w, final_h = rotation_matrix_for_image(geom["out_w"], geom["out_h"], angle)
-        left = float(self.item().get("x", 0.0)) - final_w / 2.0
-        top = float(self.item().get("y", 0.0)) - final_h / 2.0
+        left = float(draft.get("x", 0.0)) - final_w / 2.0
+        top = float(draft.get("y", 0.0)) - final_h / 2.0
         return pre.shape, geom, matrix, final_w, final_h, left, top
 
     def control_point_image_pos(self, idx):
