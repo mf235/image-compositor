@@ -20,7 +20,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QByteArray, QMimeData, QPoint, QPointF, QRect, QSize, Qt, QUrl
+from PyQt5.QtCore import QByteArray, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, Qt, QUrl
 from PyQt5.QtGui import QColor, QDesktopServices, QDrag, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
     QApplication,
@@ -905,6 +905,9 @@ class PlacedListWidget(QListWidget):
 
 
 class CanvasWidget(QWidget):
+    MIN_ZOOM = 0.05
+    MAX_ZOOM = 20.0
+
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
@@ -915,6 +918,10 @@ class CanvasWidget(QWidget):
         self.display_rect = QRect()
         self.dragging_item = False
         self.drag_offset = QPointF(0, 0)
+        self.panning_view = False
+        self.pan_last_pos = None
+        self.zoom_scale = 1.0
+        self.view_center = None
         self._last_drag_ui_update = 0.0
         self._bg_cache_image_id = None
         self._bg_cache_size = QSize()
@@ -923,8 +930,101 @@ class CanvasWidget(QWidget):
         self.setStyleSheet("background-color: #202020;")
         self.setFocusPolicy(Qt.StrongFocus)
 
+    def current_canvas_image(self):
+        if self.dragging_item and self.main_window.drag_preview_image is not None:
+            return self.main_window.drag_preview_image
+        return self.main_window.preview_image
+
+    def image_shape(self):
+        img = self.current_canvas_image()
+        if img is None:
+            img = self.main_window.base_image
+        if img is None:
+            return None
+        return img.shape[:2]
+
+    def ensure_view_center(self):
+        shape = self.image_shape()
+        if shape is None:
+            self.view_center = None
+            return
+        h, w = shape
+        if self.view_center is None:
+            self.view_center = QPointF(w / 2.0, h / 2.0)
+        self.clamp_view_center()
+
+    def get_fit_scale(self):
+        shape = self.image_shape()
+        if shape is None:
+            return 1.0
+        h, w = shape
+        area_w = max(1, self.width() - 8)
+        area_h = max(1, self.height() - 8)
+        return max(self.MIN_ZOOM, min(area_w / max(1, w), area_h / max(1, h)))
+
+    def get_current_scale(self):
+        return max(self.MIN_ZOOM, min(self.MAX_ZOOM, self.get_fit_scale() * self.zoom_scale))
+
+    def clamp_view_center(self):
+        shape = self.image_shape()
+        if shape is None or self.view_center is None:
+            return
+        h, w = shape
+        scale = self.get_current_scale()
+        view_w = self.width() / max(scale, 1e-6)
+        view_h = self.height() / max(scale, 1e-6)
+
+        if view_w >= w:
+            cx = w / 2.0
+        else:
+            half = view_w / 2.0
+            cx = min(max(self.view_center.x(), half), w - half)
+
+        if view_h >= h:
+            cy = h / 2.0
+        else:
+            half = view_h / 2.0
+            cy = min(max(self.view_center.y(), half), h - half)
+
+        self.view_center = QPointF(cx, cy)
+
+    def reset_view(self):
+        self.zoom_scale = 1.0
+        self.view_center = None
+        self.ensure_view_center()
+        self.invalidate_background_cache()
+        self.update()
+
+    def set_zoom(self, new_zoom_scale, anchor_pos=None):
+        shape = self.image_shape()
+        if shape is None:
+            return
+        self.ensure_view_center()
+        if self.view_center is None:
+            return
+        old_scale = self.get_current_scale()
+        if anchor_pos is not None:
+            anchor_img = QPointF(
+                self.view_center.x() + (anchor_pos.x() - self.width() / 2.0) / max(old_scale, 1e-6),
+                self.view_center.y() + (anchor_pos.y() - self.height() / 2.0) / max(old_scale, 1e-6),
+            )
+        else:
+            anchor_img = None
+
+        self.zoom_scale = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(new_zoom_scale)))
+        new_scale = self.get_current_scale()
+        if anchor_img is not None:
+            self.view_center = QPointF(
+                anchor_img.x() - (anchor_pos.x() - self.width() / 2.0) / max(new_scale, 1e-6),
+                anchor_img.y() - (anchor_pos.y() - self.height() / 2.0) / max(new_scale, 1e-6),
+            )
+        self.clamp_view_center()
+        self.invalidate_background_cache()
+        self.update()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self.clamp_view_center()
         self.invalidate_background_cache()
 
     def dragEnterEvent(self, event):
@@ -960,16 +1060,45 @@ class CanvasWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor(32, 32, 32))
 
-        image = self.main_window.drag_preview_image if self.dragging_item and self.main_window.drag_preview_image is not None else self.main_window.preview_image
+        image = self.current_canvas_image()
         if image is None:
             painter.setPen(QColor(230, 230, 230))
-            painter.drawText(self.rect(), Qt.AlignCenter, "ここに元画像をドロップ\nまたは [元画像を開く]")
+            painter.drawText(self.rect(), Qt.AlignCenter, "ここに元画像をドロップ\nまたは [画像]")
+            self.display_rect = QRect()
             return
 
-        scaled, rect = self.get_cached_background_pixmap(image)
-        self.display_rect = rect
-        if scaled is not None:
-            painter.drawPixmap(rect.left(), rect.top(), scaled)
+        self.ensure_view_center()
+        scale = self.get_current_scale()
+        h, w = image.shape[:2]
+        if self.view_center is None:
+            return
+
+        self.display_rect = QRect(
+            int(round(self.width() / 2.0 - self.view_center.x() * scale)),
+            int(round(self.height() / 2.0 - self.view_center.y() * scale)),
+            int(round(w * scale)),
+            int(round(h * scale)),
+        )
+
+        view_w_img = self.width() / max(scale, 1e-6)
+        view_h_img = self.height() / max(scale, 1e-6)
+        x0_f = self.view_center.x() - view_w_img / 2.0
+        y0_f = self.view_center.y() - view_h_img / 2.0
+        x1_f = self.view_center.x() + view_w_img / 2.0
+        y1_f = self.view_center.y() + view_h_img / 2.0
+
+        x0 = max(0, int(math.floor(x0_f)))
+        y0 = max(0, int(math.floor(y0_f)))
+        x1 = min(w, int(math.ceil(x1_f)))
+        y1 = min(h, int(math.ceil(y1_f)))
+        if x1 > x0 and y1 > y0:
+            crop = image[y0:y1, x0:x1]
+            pix = QPixmap.fromImage(bgra_to_qimage(crop))
+            target_x = self.width() / 2.0 - (self.view_center.x() - x0) * scale
+            target_y = self.height() / 2.0 - (self.view_center.y() - y0) * scale
+            target_w = (x1 - x0) * scale
+            target_h = (y1 - y0) * scale
+            painter.drawPixmap(QRectF(target_x, target_y, target_w, target_h), pix, QRectF(pix.rect()))
 
         if self.dragging_item:
             self.draw_fast_drag_item(painter)
@@ -995,30 +1124,13 @@ class CanvasWidget(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 painter.drawPolygon(poly)
 
-        # 下部情報
         painter.setPen(QColor(220, 220, 220))
-        info = "素材一覧からドラッグして配置 / 画像中の素材をドラッグで移動 / Deleteで削除"
+        info = "素材D&Dで配置 / ホイール:拡大縮小 / 空白ドラッグ:表示移動 / 素材ドラッグ:移動 / Deleteで削除"
         painter.drawText(12, self.height() - 14, info)
 
     def get_cached_background_pixmap(self, image):
-        if image is None:
-            return None, QRect()
-        image_id = id(image)
-        if (
-            self._bg_cache_pixmap is None
-            or self._bg_cache_image_id != image_id
-            or self._bg_cache_size != self.size()
-        ):
-            qimg = bgra_to_qimage(image)
-            pix = QPixmap.fromImage(qimg)
-            scaled = pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            self._bg_cache_image_id = image_id
-            self._bg_cache_size = QSize(self.size())
-            self._bg_cache_pixmap = scaled
-            self._bg_cache_rect = QRect(x, y, scaled.width(), scaled.height())
-        return self._bg_cache_pixmap, QRect(self._bg_cache_rect)
+        # 互換用。現在はクロップ描画なので基本的に使わない。
+        return None, QRect(self.display_rect)
 
     def invalidate_background_cache(self):
         self._bg_cache_image_id = None
@@ -1054,22 +1166,30 @@ class CanvasWidget(QWidget):
         painter.drawPixmap(left, top, pix)
 
     def image_to_view(self, p: QPointF):
-        if self.main_window.base_image is None or self.display_rect.isNull():
+        if self.main_window.base_image is None:
             return None
-        h, w = self.main_window.base_image.shape[:2]
-        sx = self.display_rect.width() / float(w)
-        sy = self.display_rect.height() / float(h)
-        return QPointF(self.display_rect.left() + p.x() * sx, self.display_rect.top() + p.y() * sy)
+        self.ensure_view_center()
+        if self.view_center is None:
+            return None
+        scale = self.get_current_scale()
+        return QPointF(
+            self.width() / 2.0 + (p.x() - self.view_center.x()) * scale,
+            self.height() / 2.0 + (p.y() - self.view_center.y()) * scale,
+        )
 
     def view_to_image(self, p: QPoint):
-        if self.main_window.base_image is None or self.display_rect.isNull():
+        if self.main_window.base_image is None:
             return None
-        if not self.display_rect.contains(p):
+        self.ensure_view_center()
+        if self.view_center is None:
             return None
         h, w = self.main_window.base_image.shape[:2]
-        x = (p.x() - self.display_rect.left()) * w / float(self.display_rect.width())
-        y = (p.y() - self.display_rect.top()) * h / float(self.display_rect.height())
-        return QPointF(max(0, min(w - 1, x)), max(0, min(h - 1, y)))
+        scale = self.get_current_scale()
+        x = self.view_center.x() + (p.x() - self.width() / 2.0) / max(scale, 1e-6)
+        y = self.view_center.y() + (p.y() - self.height() / 2.0) / max(scale, 1e-6)
+        if x < 0 or y < 0 or x >= w or y >= h:
+            return None
+        return QPointF(x, y)
 
     def item_polygon_view(self, item):
         if bool(item.get("warp_enabled", False)):
@@ -1115,6 +1235,18 @@ class CanvasWidget(QWidget):
             return None
         return QPolygonF(pts)
 
+    def wheelEvent(self, event):
+        if self.main_window.base_image is None:
+            event.ignore()
+            return
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0:
+            event.ignore()
+            return
+        factor = 1.25 ** steps
+        self.set_zoom(self.zoom_scale * factor, anchor_pos=event.pos())
+        event.accept()
+
     def mousePressEvent(self, event):
         img_pos = self.view_to_image(event.pos())
         if event.button() == Qt.RightButton:
@@ -1133,24 +1265,43 @@ class CanvasWidget(QWidget):
             self.drag_offset = QPointF(item["x"] - img_pos.x(), item["y"] - img_pos.y())
             self.main_window.begin_item_drag(idx)
             self.update()
+            return
+        self.panning_view = True
+        self.pan_last_pos = event.pos()
+        self.setCursor(Qt.ClosedHandCursor)
+        self.update()
 
     def mouseMoveEvent(self, event):
-        if not self.dragging_item:
+        if self.dragging_item:
+            img_pos = self.view_to_image(event.pos())
+            idx = self.main_window.selected_index
+            if img_pos is None or idx is None:
+                return
+            item = self.main_window.items[idx]
+            item["x"] = float(img_pos.x() + self.drag_offset.x())
+            item["y"] = float(img_pos.y() + self.drag_offset.y())
+            self.update()
+            now = time.monotonic()
+            if now - self._last_drag_ui_update >= 0.05:
+                self._last_drag_ui_update = now
+                if hasattr(self.main_window, "loupe_view"):
+                    self.main_window.loupe_view.update()
+                self.main_window.update_placed_list_text()
             return
-        img_pos = self.view_to_image(event.pos())
-        idx = self.main_window.selected_index
-        if img_pos is None or idx is None:
+        if self.panning_view and self.pan_last_pos is not None and self.view_center is not None:
+            scale = self.get_current_scale()
+            delta = event.pos() - self.pan_last_pos
+            self.view_center = QPointF(
+                self.view_center.x() - delta.x() / max(scale, 1e-6),
+                self.view_center.y() - delta.y() / max(scale, 1e-6),
+            )
+            self.pan_last_pos = event.pos()
+            self.clamp_view_center()
+            self.invalidate_background_cache()
+            self.update()
+            event.accept()
             return
-        item = self.main_window.items[idx]
-        item["x"] = float(img_pos.x() + self.drag_offset.x())
-        item["y"] = float(img_pos.y() + self.drag_offset.y())
-        self.update()
-        now = time.monotonic()
-        if now - self._last_drag_ui_update >= 0.05:
-            self._last_drag_ui_update = now
-            if hasattr(self.main_window, "loupe_view"):
-                self.main_window.loupe_view.update()
-            self.main_window.update_placed_list_text()
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self.dragging_item:
@@ -1159,13 +1310,21 @@ class CanvasWidget(QWidget):
             if hasattr(self.main_window, "loupe_view"):
                 self.main_window.loupe_view.update()
             self.main_window.end_item_drag()
+            event.accept()
+            return
+        if self.panning_view:
+            self.panning_view = False
+            self.pan_last_pos = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:
             self.main_window.delete_selected_item()
         else:
             super().keyPressEvent(event)
-
 
 
 class WarpEditorCanvas(QWidget):
@@ -2184,6 +2343,8 @@ class ImageCompositor(QMainWindow):
             return
         self.base_image_path = path
         self.base_image = ensure_bgra(img)
+        if hasattr(self, "canvas"):
+            self.canvas.reset_view()
         self.statusBar().showMessage(f"元画像: {path}")
         self.refresh_preview(save=False)
         if save:
