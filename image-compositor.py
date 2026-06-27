@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -55,6 +56,8 @@ PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
 PART_MIME = "application/x-image-compositor-part-id"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+WARP_GRID_ROWS = 4
+WARP_GRID_COLS = 4
 
 
 # -----------------------------------------------------------------------------
@@ -172,6 +175,176 @@ def apply_flip(src_bgra, flip_h=False, flip_v=False):
     return img
 
 
+def default_warp_points(rows=WARP_GRID_ROWS, cols=WARP_GRID_COLS):
+    points = []
+    for r in range(rows):
+        y = r / float(rows - 1) if rows > 1 else 0.0
+        for c in range(cols):
+            x = c / float(cols - 1) if cols > 1 else 0.0
+            points.append([float(x), float(y)])
+    return points
+
+
+def normalized_warp_points(points, rows=WARP_GRID_ROWS, cols=WARP_GRID_COLS):
+    expected = rows * cols
+    if not isinstance(points, list) or len(points) != expected:
+        return default_warp_points(rows, cols)
+    out = []
+    try:
+        for p in points:
+            out.append([float(p[0]), float(p[1])])
+    except Exception:
+        return default_warp_points(rows, cols)
+    return out
+
+
+def get_item_warp_points(item):
+    return normalized_warp_points(
+        item.get("warp_points"),
+        int(item.get("warp_grid_rows", WARP_GRID_ROWS)),
+        int(item.get("warp_grid_cols", WARP_GRID_COLS)),
+    )
+
+
+def warp_geometry(width, height, points, rows=WARP_GRID_ROWS, cols=WARP_GRID_COLS):
+    width = max(1, int(width))
+    height = max(1, int(height))
+    pts = normalized_warp_points(points, rows, cols)
+    src_pts = []
+    dst_pts = []
+    for r in range(rows):
+        sy = r * (height - 1) / float(rows - 1) if rows > 1 else 0.0
+        for c in range(cols):
+            sx = c * (width - 1) / float(cols - 1) if cols > 1 else 0.0
+            idx = r * cols + c
+            dx = pts[idx][0] * (width - 1)
+            dy = pts[idx][1] * (height - 1)
+            src_pts.append([sx, sy])
+            dst_pts.append([dx, dy])
+
+    dst_arr = np.array(dst_pts, dtype=np.float32)
+    min_x = int(math.floor(float(np.min(dst_arr[:, 0]))))
+    min_y = int(math.floor(float(np.min(dst_arr[:, 1]))))
+    max_x = int(math.ceil(float(np.max(dst_arr[:, 0]))))
+    max_y = int(math.ceil(float(np.max(dst_arr[:, 1]))))
+    out_w = max(1, max_x - min_x + 1)
+    out_h = max(1, max_y - min_y + 1)
+    shift_x = -min_x
+    shift_y = -min_y
+    shifted_dst = [[x + shift_x, y + shift_y] for x, y in dst_pts]
+    return {
+        "src_pts": np.array(src_pts, dtype=np.float32),
+        "dst_pts": np.array(dst_pts, dtype=np.float32),
+        "shifted_dst_pts": np.array(shifted_dst, dtype=np.float32),
+        "shift_x": float(shift_x),
+        "shift_y": float(shift_y),
+        "out_w": int(out_w),
+        "out_h": int(out_h),
+        "rows": int(rows),
+        "cols": int(cols),
+    }
+
+
+def rotation_matrix_for_image(width, height, angle_degrees):
+    angle = float(angle_degrees)
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if abs(angle) < 1e-4:
+        matrix = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        return matrix, width, height
+    center = (width / 2.0, height / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_w = max(1, int((height * sin) + (width * cos)))
+    new_h = max(1, int((height * cos) + (width * sin)))
+    matrix[0, 2] += (new_w / 2.0) - center[0]
+    matrix[1, 2] += (new_h / 2.0) - center[1]
+    return matrix.astype(np.float32), new_w, new_h
+
+
+def resize_image(src_bgra, scale_w: float, scale_h: float = None):
+    img = ensure_bgra(src_bgra)
+    scale_w = max(0.02, float(scale_w))
+    scale_h = scale_w if scale_h is None else max(0.02, float(scale_h))
+    if abs(scale_w - 1.0) <= 1e-4 and abs(scale_h - 1.0) <= 1e-4:
+        return img
+    h, w = img.shape[:2]
+    nw = max(1, int(round(w * scale_w)))
+    nh = max(1, int(round(h * scale_h)))
+    interp = cv2.INTER_AREA if scale_w < 1.0 or scale_h < 1.0 else cv2.INTER_CUBIC
+    return cv2.resize(img, (nw, nh), interpolation=interp)
+
+
+def rotate_image(src_bgra, angle_degrees: float):
+    img = ensure_bgra(src_bgra)
+    h, w = img.shape[:2]
+    matrix, new_w, new_h = rotation_matrix_for_image(w, h, angle_degrees)
+    if abs(float(angle_degrees)) < 1e-4:
+        return img
+    return cv2.warpAffine(
+        img,
+        matrix,
+        (new_w, new_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+
+def _warp_triangle(src, dst, tri_src, tri_dst):
+    tri_src = np.array(tri_src, dtype=np.float32)
+    tri_dst = np.array(tri_dst, dtype=np.float32)
+    r1 = cv2.boundingRect(tri_src)
+    r2 = cv2.boundingRect(tri_dst)
+    x1, y1, w1, h1 = r1
+    x2, y2, w2, h2 = r2
+    if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
+        return
+
+    src_crop = src[y1:y1 + h1, x1:x1 + w1]
+    if src_crop.size == 0:
+        return
+    tri_src_rect = tri_src - np.array([x1, y1], dtype=np.float32)
+    tri_dst_rect = tri_dst - np.array([x2, y2], dtype=np.float32)
+    matrix = cv2.getAffineTransform(tri_src_rect, tri_dst_rect)
+    warped = cv2.warpAffine(
+        src_crop,
+        matrix,
+        (w2, h2),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+    mask = np.zeros((h2, w2), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.int32(np.round(tri_dst_rect)), 255, lineType=cv2.LINE_AA)
+    warped = ensure_bgra(warped)
+    warped[:, :, 3] = np.clip(warped[:, :, 3].astype(np.float32) * (mask.astype(np.float32) / 255.0), 0, 255).astype(np.uint8)
+    alpha_composite_bgra(dst, warped, x2, y2)
+
+
+def apply_mesh_warp(src_bgra, points, rows=WARP_GRID_ROWS, cols=WARP_GRID_COLS):
+    img = ensure_bgra(src_bgra)
+    h, w = img.shape[:2]
+    pts = normalized_warp_points(points, rows, cols)
+    if pts == default_warp_points(rows, cols):
+        return img
+    geom = warp_geometry(w, h, pts, rows, cols)
+    out = np.zeros((geom["out_h"], geom["out_w"], 4), dtype=np.uint8)
+    src_pts = geom["src_pts"]
+    dst_pts = geom["shifted_dst_pts"]
+
+    for r in range(rows - 1):
+        for c in range(cols - 1):
+            i00 = r * cols + c
+            i10 = r * cols + c + 1
+            i01 = (r + 1) * cols + c
+            i11 = (r + 1) * cols + c + 1
+            _warp_triangle(img, out, [src_pts[i00], src_pts[i10], src_pts[i11]], [dst_pts[i00], dst_pts[i10], dst_pts[i11]])
+            _warp_triangle(img, out, [src_pts[i00], src_pts[i11], src_pts[i01]], [dst_pts[i00], dst_pts[i11], dst_pts[i01]])
+    return out
+
+
 def item_scale_w(item):
     return max(0.02, float(item.get("scale_w", item.get("scale", 1.0))))
 
@@ -183,39 +356,8 @@ def item_scale_h(item):
 
 
 def resize_and_rotate(src_bgra, scale_w: float, angle_degrees: float, scale_h: float = None):
-    img = ensure_bgra(src_bgra)
-    scale_w = max(0.02, float(scale_w))
-    scale_h = scale_w if scale_h is None else max(0.02, float(scale_h))
-
-    if abs(scale_w - 1.0) > 1e-4 or abs(scale_h - 1.0) > 1e-4:
-        h, w = img.shape[:2]
-        nw = max(1, int(round(w * scale_w)))
-        nh = max(1, int(round(h * scale_h)))
-        interp = cv2.INTER_AREA if scale_w < 1.0 or scale_h < 1.0 else cv2.INTER_CUBIC
-        img = cv2.resize(img, (nw, nh), interpolation=interp)
-
-    angle = float(angle_degrees)
-    if abs(angle) < 1e-4:
-        return img
-
-    h, w = img.shape[:2]
-    center = (w / 2.0, h / 2.0)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-    cos = abs(matrix[0, 0])
-    sin = abs(matrix[0, 1])
-    new_w = int((h * sin) + (w * cos))
-    new_h = int((h * cos) + (w * sin))
-    matrix[0, 2] += (new_w / 2.0) - center[0]
-    matrix[1, 2] += (new_h / 2.0) - center[1]
-    rotated = cv2.warpAffine(
-        img,
-        matrix,
-        (new_w, new_h),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0),
-    )
-    return rotated
+    img = resize_image(src_bgra, scale_w, scale_h)
+    return rotate_image(img, angle_degrees)
 
 
 def alpha_composite_bgra(dst_bgra, src_bgra, x: int, y: int):
@@ -928,6 +1070,24 @@ class CanvasWidget(QWidget):
         return QPointF(max(0, min(w - 1, x)), max(0, min(h - 1, y)))
 
     def item_polygon_view(self, item):
+        if bool(item.get("warp_enabled", False)):
+            part_img = self.main_window.render_item_image_fast(item)
+            if part_img is None:
+                return None
+            h, w = part_img.shape[:2]
+            cx = float(item.get("x", 0.0))
+            cy = float(item.get("y", 0.0))
+            corners = [
+                QPointF(cx - w / 2.0, cy - h / 2.0),
+                QPointF(cx + w / 2.0, cy - h / 2.0),
+                QPointF(cx + w / 2.0, cy + h / 2.0),
+                QPointF(cx - w / 2.0, cy + h / 2.0),
+            ]
+            pts = [self.image_to_view(p) for p in corners]
+            if any(p is None for p in pts):
+                return None
+            return QPolygonF(pts)
+
         part = self.main_window.get_part_image(item.get("part_id"))
         if part is None:
             return None
@@ -944,8 +1104,6 @@ class CanvasWidget(QWidget):
         cx = float(item.get("x", 0.0))
         cy = float(item.get("y", 0.0))
         for px, py in corners:
-            # OpenCVのwarpAffine/getRotationMatrix2Dと同じ向きに合わせる。
-            # 以前の式はQt/数学座標寄りで、見た目と逆回転になっていた。
             rx = px * cos_a + py * sin_a
             ry = -px * sin_a + py * cos_a
             vp = self.image_to_view(QPointF(cx + rx, cy + ry))
@@ -1005,6 +1163,274 @@ class CanvasWidget(QWidget):
             self.main_window.delete_selected_item()
         else:
             super().keyPressEvent(event)
+
+
+
+class WarpEditorCanvas(QWidget):
+    def __init__(self, dialog):
+        super().__init__()
+        self.dialog = dialog
+        self.setMinimumSize(720, 520)
+        self.setMouseTracking(True)
+        self.display_rect = QRect()
+        self.drag_index = None
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setStyleSheet("background-color: #202020;")
+
+    def image_to_view(self, p: QPointF):
+        base = self.dialog.main_window.base_image
+        if base is None or self.display_rect.isNull():
+            return None
+        h, w = base.shape[:2]
+        return QPointF(
+            self.display_rect.left() + p.x() * self.display_rect.width() / float(w),
+            self.display_rect.top() + p.y() * self.display_rect.height() / float(h),
+        )
+
+    def view_to_image(self, p: QPoint):
+        base = self.dialog.main_window.base_image
+        if base is None or self.display_rect.isNull() or not self.display_rect.contains(p):
+            return None
+        h, w = base.shape[:2]
+        return QPointF(
+            (p.x() - self.display_rect.left()) * w / float(self.display_rect.width()),
+            (p.y() - self.display_rect.top()) * h / float(self.display_rect.height()),
+        )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor(32, 32, 32))
+
+        img = self.dialog.preview_image()
+        if img is None:
+            painter.setPen(QColor(230, 230, 230))
+            painter.drawText(self.rect(), Qt.AlignCenter, "プレビューを作成できません")
+            return
+
+        qimg = bgra_to_qimage(img)
+        pix = QPixmap.fromImage(qimg)
+        scaled = pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        self.display_rect = QRect(x, y, scaled.width(), scaled.height())
+        painter.drawPixmap(x, y, scaled)
+
+        view_points = []
+        for idx in range(WARP_GRID_ROWS * WARP_GRID_COLS):
+            p = self.dialog.control_point_image_pos(idx)
+            vp = self.image_to_view(p) if p is not None else None
+            view_points.append(vp)
+
+        pen_line = QPen(QColor(80, 210, 255), 1, Qt.SolidLine)
+        painter.setPen(pen_line)
+        for r in range(WARP_GRID_ROWS):
+            for c in range(WARP_GRID_COLS - 1):
+                a = view_points[r * WARP_GRID_COLS + c]
+                b = view_points[r * WARP_GRID_COLS + c + 1]
+                if a is not None and b is not None:
+                    painter.drawLine(a, b)
+        for c in range(WARP_GRID_COLS):
+            for r in range(WARP_GRID_ROWS - 1):
+                a = view_points[r * WARP_GRID_COLS + c]
+                b = view_points[(r + 1) * WARP_GRID_COLS + c]
+                if a is not None and b is not None:
+                    painter.drawLine(a, b)
+
+        for idx, vp in enumerate(view_points):
+            if vp is None:
+                continue
+            selected = idx == self.drag_index
+            radius = 6 if selected else 5
+            color = QColor(255, 230, 80) if selected else QColor(80, 210, 255)
+            painter.setPen(QPen(QColor(20, 20, 20), 2))
+            painter.setBrush(color)
+            painter.drawEllipse(vp, radius, radius)
+
+        painter.setPen(QColor(230, 230, 230))
+        painter.drawText(10, self.height() - 12, "制御点をドラッグ / R:リセット / Enter:適用 / Esc:キャンセル")
+
+    def nearest_control_point(self, pos):
+        best_idx = None
+        best_dist = 14.0
+        for idx in range(WARP_GRID_ROWS * WARP_GRID_COLS):
+            p = self.dialog.control_point_image_pos(idx)
+            vp = self.image_to_view(p) if p is not None else None
+            if vp is None:
+                continue
+            dx = vp.x() - pos.x()
+            dy = vp.y() - pos.y()
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            idx = self.nearest_control_point(event.pos())
+            if idx is not None:
+                self.drag_index = idx
+                self.dialog.set_dragged_point_from_image(idx, self.view_to_image(event.pos()))
+                self.update()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_index is not None:
+            self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.drag_index is not None:
+            self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
+            self.drag_index = None
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_R:
+            self.dialog.reset_points()
+            event.accept()
+            return
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.dialog.accept()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.dialog.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class WarpDialog(QDialog):
+    def __init__(self, main_window, item_index):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.item_index = item_index
+        self.setWindowTitle("ワープ編集")
+        self.resize(980, 720)
+        self.points = get_item_warp_points(self.item()).copy()
+        self._preview_cache = None
+        self._preview_cache_key = None
+
+        layout = QVBoxLayout(self)
+        self.canvas = WarpEditorCanvas(self)
+        layout.addWidget(self.canvas, 1)
+
+        button_row = QHBoxLayout()
+        self.reset_btn = QPushButton("リセット")
+        self.reset_btn.clicked.connect(self.reset_points)
+        self.apply_btn = QPushButton("適用")
+        self.apply_btn.clicked.connect(self.accept)
+        self.cancel_btn = QPushButton("キャンセル")
+        self.cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(self.reset_btn)
+        button_row.addStretch(1)
+        button_row.addWidget(self.apply_btn)
+        button_row.addWidget(self.cancel_btn)
+        layout.addLayout(button_row)
+
+    def item(self):
+        return self.main_window.items[self.item_index]
+
+    def draft_item(self):
+        draft = dict(self.item())
+        draft["warp_enabled"] = True
+        draft["warp_grid_rows"] = WARP_GRID_ROWS
+        draft["warp_grid_cols"] = WARP_GRID_COLS
+        draft["warp_points"] = [[float(x), float(y)] for x, y in self.points]
+        return draft
+
+    def reset_points(self):
+        self.points = default_warp_points()
+        self.invalidate_preview()
+        self.canvas.update()
+
+    def invalidate_preview(self):
+        self._preview_cache = None
+        self._preview_cache_key = None
+
+    def preview_image(self):
+        base = self.main_window.base_image
+        if base is None:
+            return None
+        key = tuple((round(x, 4), round(y, 4)) for x, y in self.points)
+        if self._preview_cache is not None and key == self._preview_cache_key:
+            return self._preview_cache
+        canvas = base.copy()
+        item = self.draft_item()
+        part_img = self.main_window.render_item_image(item, base)
+        if part_img is not None:
+            ih, iw = part_img.shape[:2]
+            left = int(round(float(item.get("x", 0.0)) - iw / 2.0))
+            top = int(round(float(item.get("y", 0.0)) - ih / 2.0))
+            alpha_composite_bgra(canvas, part_img, left, top)
+        self._preview_cache = canvas
+        self._preview_cache_key = key
+        return canvas
+
+    def pre_warp_image(self):
+        return self.main_window.render_item_pre_warp(self.draft_item(), self.main_window.base_image)
+
+    def warp_display_geometry(self):
+        pre = self.pre_warp_image()
+        if pre is None:
+            return None
+        h, w = pre.shape[:2]
+        geom = warp_geometry(w, h, self.points)
+        angle = float(self.item().get("rotation", 0.0)) if bool(self.item().get("rotation_enabled", False)) else 0.0
+        matrix, final_w, final_h = rotation_matrix_for_image(geom["out_w"], geom["out_h"], angle)
+        left = float(self.item().get("x", 0.0)) - final_w / 2.0
+        top = float(self.item().get("y", 0.0)) - final_h / 2.0
+        return pre.shape, geom, matrix, final_w, final_h, left, top
+
+    def control_point_image_pos(self, idx):
+        data = self.warp_display_geometry()
+        if data is None:
+            return None
+        _, geom, matrix, _, _, left, top = data
+        p = geom["shifted_dst_pts"][idx]
+        rx = float(matrix[0, 0] * p[0] + matrix[0, 1] * p[1] + matrix[0, 2])
+        ry = float(matrix[1, 0] * p[0] + matrix[1, 1] * p[1] + matrix[1, 2])
+        return QPointF(left + rx, top + ry)
+
+    def set_dragged_point_from_image(self, idx, image_pos):
+        if image_pos is None:
+            return
+        data = self.warp_display_geometry()
+        if data is None:
+            return
+        pre_shape, geom, matrix, _, _, left, top = data
+        h, w = pre_shape[:2]
+        local_x = float(image_pos.x()) - left
+        local_y = float(image_pos.y()) - top
+        m3 = np.array([[matrix[0, 0], matrix[0, 1], matrix[0, 2]], [matrix[1, 0], matrix[1, 1], matrix[1, 2]], [0.0, 0.0, 1.0]], dtype=np.float32)
+        inv = np.linalg.inv(m3)
+        wx, wy, _ = inv.dot(np.array([local_x, local_y, 1.0], dtype=np.float32))
+        raw_x = float(wx) - float(geom["shift_x"])
+        raw_y = float(wy) - float(geom["shift_y"])
+        nx = raw_x / max(1.0, float(w - 1))
+        ny = raw_y / max(1.0, float(h - 1))
+        self.points[idx] = [float(nx), float(ny)]
+        self.invalidate_preview()
+
+    def accept(self):
+        item = self.item()
+        item["warp_enabled"] = True
+        item["warp_grid_rows"] = WARP_GRID_ROWS
+        item["warp_grid_cols"] = WARP_GRID_COLS
+        item["warp_points"] = [[float(x), float(y)] for x, y in self.points]
+        self.main_window.update_controls_from_item()
+        self.main_window.refresh_preview(save=True)
+        super().accept()
 
 
 # -----------------------------------------------------------------------------
@@ -1260,6 +1686,21 @@ class ImageCompositor(QMainWindow):
         flip_form.addRow(self.flip_v_check)
         settings_form.addWidget(flip_box)
 
+        # ワープ
+        warp_box = QGroupBox("ワープ")
+        warp_box.setCheckable(True)
+        warp_box.setChecked(False)
+        warp_box.toggled.connect(self.controls_to_item)
+        self.warp_check = warp_box
+        warp_layout = QHBoxLayout(warp_box)
+        self.warp_edit_btn = QPushButton("ワープ編集")
+        self.warp_edit_btn.clicked.connect(self.open_warp_dialog)
+        self.warp_reset_btn = QPushButton("リセット")
+        self.warp_reset_btn.clicked.connect(self.reset_selected_warp)
+        warp_layout.addWidget(self.warp_edit_btn)
+        warp_layout.addWidget(self.warp_reset_btn)
+        settings_form.addWidget(warp_box)
+
         # 色合わせ
         color_box = QGroupBox("色を合わせる")
         color_box.setCheckable(True)
@@ -1474,6 +1915,10 @@ class ImageCompositor(QMainWindow):
             "rotation": float(self.rotation_spin.value()),
             "flip_h": bool(self.flip_h_check.isChecked()),
             "flip_v": bool(self.flip_v_check.isChecked()),
+            "warp_enabled": bool(self.warp_check.isChecked()),
+            "warp_grid_rows": WARP_GRID_ROWS,
+            "warp_grid_cols": WARP_GRID_COLS,
+            "warp_points": default_warp_points(),
             "color_enabled": bool(self.color_check.isChecked()),
             "color_target": "local" if self.color_target_combo.currentIndex() == 1 else "global",
             "color_algo": int(self.color_algo_combo.currentIndex()),
@@ -2005,13 +2450,45 @@ class ImageCompositor(QMainWindow):
         self.refresh_placed_list()
         self.refresh_preview(save=True)
 
+    def open_warp_dialog(self):
+        idx = self.selected_index
+        if idx is None or not (0 <= idx < len(self.items)):
+            return
+        if self.base_image is None:
+            QMessageBox.warning(self, "ワープ不可", "先に元画像を読み込んでください。")
+            return
+        if self.get_part_image(self.items[idx].get("part_id")) is None:
+            QMessageBox.warning(self, "ワープ不可", "素材画像を読み込めません。")
+            return
+        dialog = WarpDialog(self, idx)
+        dialog.exec_()
+
+    def reset_selected_warp(self):
+        item = self.selected_item()
+        if item is None:
+            return
+        item["warp_grid_rows"] = WARP_GRID_ROWS
+        item["warp_grid_cols"] = WARP_GRID_COLS
+        item["warp_points"] = default_warp_points()
+        self.refresh_preview(save=True)
+
     def hit_test_item(self, x, y):
-        # 前面から判定。透明部分でも、黄色い枠の内側なら掴めるようにする。
-        # 判定は item_polygon_view と同じOpenCV向きの回転式に合わせる。
+        # 前面から判定。透明部分でも、表示枠の内側なら掴めるようにする。
         for idx in reversed(range(len(self.items))):
             item = self.items[idx]
             if not item.get("visible", True):
                 continue
+            if bool(item.get("warp_enabled", False)):
+                part_img = self.render_item_image_fast(item)
+                if part_img is None:
+                    continue
+                h, w = part_img.shape[:2]
+                cx = float(item.get("x", 0.0))
+                cy = float(item.get("y", 0.0))
+                if cx - w / 2.0 <= float(x) <= cx + w / 2.0 and cy - h / 2.0 <= float(y) <= cy + h / 2.0:
+                    return idx
+                continue
+
             part = self.get_part_image(item.get("part_id"))
             if part is None:
                 continue
@@ -2024,8 +2501,6 @@ class ImageCompositor(QMainWindow):
             cos_a = math.cos(angle)
             sin_a = math.sin(angle)
 
-            # forward: rx = sx*cos + sy*sin, ry = -sx*sin + sy*cos
-            # inverse: sx = dx*cos - dy*sin, sy = dx*sin + dy*cos
             sx = dx * cos_a - dy * sin_a
             sy = dx * sin_a + dy * cos_a
             lx = sx / scale_w
@@ -2052,6 +2527,9 @@ class ImageCompositor(QMainWindow):
             self.rotation_spin,
             self.flip_h_check,
             self.flip_v_check,
+            self.warp_check,
+            self.warp_edit_btn,
+            self.warp_reset_btn,
             self.color_check,
             self.color_target_combo,
             self.color_algo_combo,
@@ -2083,6 +2561,11 @@ class ImageCompositor(QMainWindow):
             self.rotation_spin.setValue(float(item.get("rotation", 0.0)))
             self.flip_h_check.setChecked(bool(item.get("flip_h", False)))
             self.flip_v_check.setChecked(bool(item.get("flip_v", False)))
+            self.warp_check.setChecked(bool(item.get("warp_enabled", False)))
+            if not isinstance(item.get("warp_points"), list) or len(item.get("warp_points", [])) != WARP_GRID_ROWS * WARP_GRID_COLS:
+                item["warp_points"] = default_warp_points()
+                item["warp_grid_rows"] = WARP_GRID_ROWS
+                item["warp_grid_cols"] = WARP_GRID_COLS
             self.color_check.setChecked(bool(item.get("color_enabled", False)))
             self.color_target_combo.setCurrentIndex(1 if item.get("color_target", "local") == "local" else 0)
             self.color_algo_combo.setCurrentIndex(int(item.get("color_algo", 1)))
@@ -2115,6 +2598,11 @@ class ImageCompositor(QMainWindow):
         item["rotation"] = float(self.rotation_spin.value())
         item["flip_h"] = bool(self.flip_h_check.isChecked())
         item["flip_v"] = bool(self.flip_v_check.isChecked())
+        item["warp_enabled"] = bool(self.warp_check.isChecked())
+        item["warp_grid_rows"] = WARP_GRID_ROWS
+        item["warp_grid_cols"] = WARP_GRID_COLS
+        if not isinstance(item.get("warp_points"), list) or len(item.get("warp_points", [])) != WARP_GRID_ROWS * WARP_GRID_COLS:
+            item["warp_points"] = default_warp_points()
         item["color_enabled"] = bool(self.color_check.isChecked())
         item["color_target"] = "local" if self.color_target_combo.currentIndex() == 1 else "global"
         item["color_algo"] = int(self.color_algo_combo.currentIndex())
@@ -2203,13 +2691,13 @@ class ImageCompositor(QMainWindow):
 
     def render_item_image_fast(self, item):
         """移動中だけ使う軽量表示。色合わせ・輪郭なじませ・影は省く。"""
-        part = self.get_part_image(item.get("part_id"))
-        if part is None:
+        img = self.render_item_pre_warp(item, self.base_image, apply_color=False)
+        if img is None:
             return None
-        img = part.copy()
-        img = apply_flip(img, bool(item.get("flip_h", False)), bool(item.get("flip_v", False)))
+        if bool(item.get("warp_enabled", False)):
+            img = apply_mesh_warp(img, get_item_warp_points(item))
         angle = float(item.get("rotation", 0.0)) if bool(item.get("rotation_enabled", False)) else 0.0
-        img = resize_and_rotate(img, item_scale_w(item), angle, item_scale_h(item))
+        img = rotate_image(img, angle)
         if bool(item.get("opacity_enabled", False)):
             img = apply_opacity(img, int(item.get("opacity_percent", 100)))
         return img
@@ -2246,13 +2734,13 @@ class ImageCompositor(QMainWindow):
             return base
         return base[y1:y2, x1:x2]
 
-    def render_item_image(self, item, base):
+    def render_item_pre_warp(self, item, base, apply_color=True):
         part = self.get_part_image(item.get("part_id"))
         if part is None:
             return None
         img = part.copy()
 
-        if bool(item.get("color_enabled", False)):
+        if apply_color and bool(item.get("color_enabled", False)):
             if item.get("color_target", "local") == "local":
                 target = self.local_target_crop(base, item, img.shape)
             else:
@@ -2265,8 +2753,19 @@ class ImageCompositor(QMainWindow):
             )
 
         img = apply_flip(img, bool(item.get("flip_h", False)), bool(item.get("flip_v", False)))
+        img = resize_image(img, item_scale_w(item), item_scale_h(item))
+        return img
+
+    def render_item_image(self, item, base):
+        img = self.render_item_pre_warp(item, base, apply_color=True)
+        if img is None:
+            return None
+
+        if bool(item.get("warp_enabled", False)):
+            img = apply_mesh_warp(img, get_item_warp_points(item))
+
         angle = float(item.get("rotation", 0.0)) if bool(item.get("rotation_enabled", False)) else 0.0
-        img = resize_and_rotate(img, item_scale_w(item), angle, item_scale_h(item))
+        img = rotate_image(img, angle)
 
         # 輪郭なじませは最終サイズ・最終角度になった画像に対して行う。
         # これで n px は「配置後の見た目のピクセル数」基準になる。
