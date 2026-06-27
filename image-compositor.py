@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-image-compositor-v18.py
+image-compositor.py
 
 元画像に複数素材を配置し、輪郭なじませ・透明度・回転・拡大縮小・色合わせ・影で
 合成の手間を減らすためのGUIツール。
@@ -297,13 +297,65 @@ def color_match_bgra(source_bgra, target_bgra, algo_idx: int, strength_percent: 
     tgt_lab = cv2.cvtColor(tgt_rgb, cv2.COLOR_BGR2LAB).astype("float32")
 
     try:
-        if algo_idx in [0, 1, 2]:
+        def safe_mask(mask):
+            """有効ピクセルが少なすぎる場合は全体マスクへ戻す。"""
+            if cv2.countNonZero(mask) < 10:
+                return np.ones(mask.shape, dtype="uint8")
+            return mask
+
+        def mean_std_channel(ch, mask):
+            """OpenCVのmeanStdDevを使った通常統計。"""
+            mask = safe_mask(mask)
+            mean, std = cv2.meanStdDev(ch, mask=mask)
+            return float(mean[0][0]), float(std[0][0])
+
+        def trimmed_mean_std_channel(ch, mask, trim=5):
+            """上下の外れ値を除外した平均・標準偏差。"""
+            mask = safe_mask(mask)
+            pixels = ch[mask > 0].astype("float32")
+            if pixels.size < 10:
+                pixels = ch.reshape(-1).astype("float32")
+            if pixels.size == 0:
+                return 0.0, 1.0
+
+            low, high = np.percentile(pixels, [trim, 100 - trim])
+            trimmed = pixels[(pixels >= low) & (pixels <= high)]
+            if trimmed.size < 10:
+                trimmed = pixels
+
+            return float(np.mean(trimmed)), float(np.std(trimmed))
+
+        def transfer_channel(src_ch, src_mean, src_std, tgt_mean, tgt_std):
+            return (src_ch - src_mean) * (tgt_std / (src_std + 1e-5)) + tgt_mean
+
+        def transfer_lab_by_stats(s_lab, t_lab, s_mask, t_mask, stats_func=mean_std_channel, keep_l=False):
+            """LABの平均・標準偏差を合わせる共通処理。keep_l=Trueなら明度は元画像を維持する。"""
+            s_l_mean, s_l_std = stats_func(s_lab[:, :, 0], s_mask)
+            s_a_mean, s_a_std = stats_func(s_lab[:, :, 1], s_mask)
+            s_b_mean, s_b_std = stats_func(s_lab[:, :, 2], s_mask)
+
+            t_l_mean, t_l_std = stats_func(t_lab[:, :, 0], t_mask)
+            t_a_mean, t_a_std = stats_func(t_lab[:, :, 1], t_mask)
+            t_b_mean, t_b_std = stats_func(t_lab[:, :, 2], t_mask)
+
+            if keep_l:
+                out_l = s_lab[:, :, 0].copy()
+            else:
+                out_l = transfer_channel(s_lab[:, :, 0], s_l_mean, s_l_std, t_l_mean, t_l_std)
+            out_a = transfer_channel(s_lab[:, :, 1], s_a_mean, s_a_std, t_a_mean, t_a_std)
+            out_b = transfer_channel(s_lab[:, :, 2], s_b_mean, s_b_std, t_b_mean, t_b_std)
+            return out_l, out_a, out_b
+
+        if algo_idx in [0, 1, 2, 4, 6]:
             if algo_idx == 1:
+                # 白黒除外: 明るすぎる/暗すぎる画素を統計から外す。
                 lum_min, lum_max = 20, 235
                 src_lum_mask = ((src_lab[:, :, 0] >= lum_min) & (src_lab[:, :, 0] <= lum_max)).astype("uint8")
                 tgt_lum_mask = ((tgt_lab[:, :, 0] >= lum_min) & (tgt_lab[:, :, 0] <= lum_max)).astype("uint8")
+
                 s_mask = cv2.bitwise_and(src_mask, src_lum_mask)
                 t_mask = cv2.bitwise_and(tgt_mask, tgt_lum_mask)
+
                 if cv2.countNonZero(s_mask) < 10:
                     s_mask = src_mask
                 if cv2.countNonZero(t_mask) < 10:
@@ -316,11 +368,13 @@ def color_match_bgra(source_bgra, target_bgra, algo_idx: int, strength_percent: 
                 def get_kmeans_stats(lab_img, mask, k=5):
                     pixels = lab_img[mask > 0]
                     if len(pixels) < k:
-                        return np.mean(pixels, axis=0), np.std(pixels, axis=0)
+                        return np.mean(lab_img, axis=(0, 1)), np.std(lab_img, axis=(0, 1))
+
                     np.random.seed(42)
                     if len(pixels) > 10000:
                         indices = np.random.choice(len(pixels), 10000, replace=False)
                         pixels = pixels[indices]
+
                     pixels = np.float32(pixels)
                     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
                     _, _, centers = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
@@ -328,54 +382,91 @@ def color_match_bgra(source_bgra, target_bgra, algo_idx: int, strength_percent: 
 
                 src_mean, src_std = get_kmeans_stats(src_lab, s_mask)
                 tgt_mean, tgt_std = get_kmeans_stats(tgt_lab, t_mask)
-                l = (src_lab[:, :, 0] - src_mean[0]) * (tgt_std[0] / (src_std[0] + 1e-5)) + tgt_mean[0]
-                a = (src_lab[:, :, 1] - src_mean[1]) * (tgt_std[1] / (src_std[1] + 1e-5)) + tgt_mean[1]
-                b = (src_lab[:, :, 2] - src_mean[2]) * (tgt_std[2] / (src_std[2] + 1e-5)) + tgt_mean[2]
-            else:
-                l_mean_src, l_std_src = cv2.meanStdDev(src_lab[:, :, 0], mask=s_mask)
-                a_mean_src, a_std_src = cv2.meanStdDev(src_lab[:, :, 1], mask=s_mask)
-                b_mean_src, b_std_src = cv2.meanStdDev(src_lab[:, :, 2], mask=s_mask)
-                l_mean_tgt, l_std_tgt = cv2.meanStdDev(tgt_lab[:, :, 0], mask=t_mask)
-                a_mean_tgt, a_std_tgt = cv2.meanStdDev(tgt_lab[:, :, 1], mask=t_mask)
-                b_mean_tgt, b_std_tgt = cv2.meanStdDev(tgt_lab[:, :, 2], mask=t_mask)
 
-                l = (src_lab[:, :, 0] - l_mean_src[0][0]) * (l_std_tgt[0][0] / (l_std_src[0][0] + 1e-5)) + l_mean_tgt[0][0]
-                a = (src_lab[:, :, 1] - a_mean_src[0][0]) * (a_std_tgt[0][0] / (a_std_src[0][0] + 1e-5)) + a_mean_tgt[0][0]
-                b = (src_lab[:, :, 2] - b_mean_src[0][0]) * (b_std_tgt[0][0] / (b_std_src[0][0] + 1e-5)) + b_mean_tgt[0][0]
+                l = transfer_channel(src_lab[:, :, 0], src_mean[0], src_std[0], tgt_mean[0], tgt_std[0])
+                a = transfer_channel(src_lab[:, :, 1], src_mean[1], src_std[1], tgt_mean[1], tgt_std[1])
+                b = transfer_channel(src_lab[:, :, 2], src_mean[2], src_std[2], tgt_mean[2], tgt_std[2])
+
+            elif algo_idx == 4:
+                # 明度保持: Lは元画像のまま、a/bだけ参考画像へ寄せる。
+                l, a, b = transfer_lab_by_stats(src_lab, tgt_lab, s_mask, t_mask, keep_l=True)
+
+            elif algo_idx == 6:
+                # 安定補正: 上下5%の外れ値を除外して統計を取る。
+                l, a, b = transfer_lab_by_stats(
+                    src_lab, tgt_lab, s_mask, t_mask,
+                    stats_func=lambda ch, mask: trimmed_mean_std_channel(ch, mask, trim=5),
+                    keep_l=False
+                )
+
+            else:
+                l, a, b = transfer_lab_by_stats(src_lab, tgt_lab, s_mask, t_mask, keep_l=False)
 
         elif algo_idx == 3:
             def match_hist(src_ch, tgt_ch, s_mask, t_mask):
-                src_vals = src_ch[s_mask > 0]
-                tgt_vals = tgt_ch[t_mask > 0]
-                if len(src_vals) == 0 or len(tgt_vals) == 0:
-                    return src_ch
-                src_hist, _ = np.histogram(src_vals, bins=256, range=[0, 256])
-                tgt_hist, _ = np.histogram(tgt_vals, bins=256, range=[0, 256])
+                s_mask = safe_mask(s_mask)
+                t_mask = safe_mask(t_mask)
+                src_hist, _ = np.histogram(src_ch[s_mask > 0], bins=256, range=[0, 256])
+                tgt_hist, _ = np.histogram(tgt_ch[t_mask > 0], bins=256, range=[0, 256])
+
                 if src_hist.sum() == 0 or tgt_hist.sum() == 0:
                     return src_ch
+
                 src_cdf = src_hist.cumsum() / src_hist.sum()
                 tgt_cdf = tgt_hist.cumsum() / tgt_hist.sum()
+
                 lut = np.zeros(256, dtype="uint8")
                 for i in range(256):
-                    lut[i] = np.abs(tgt_cdf - src_cdf[i]).argmin()
-                return cv2.LUT(np.clip(src_ch, 0, 255).astype("uint8"), lut).astype("float32")
+                    idx = np.abs(tgt_cdf - src_cdf[i]).argmin()
+                    lut[i] = idx
+
+                src_ch_uint8 = np.clip(src_ch, 0, 255).astype("uint8")
+                res = cv2.LUT(src_ch_uint8, lut)
+                return res.astype("float32")
 
             l = match_hist(src_lab[:, :, 0], tgt_lab[:, :, 0], src_mask, tgt_mask)
             a = match_hist(src_lab[:, :, 1], tgt_lab[:, :, 1], src_mask, tgt_mask)
             b = match_hist(src_lab[:, :, 2], tgt_lab[:, :, 2], src_mask, tgt_mask)
 
-        else:
-            # 追加: 明るさだけ合わせる。色転びを避けたい時の安全モード。
-            l_mean_src, _ = cv2.meanStdDev(src_lab[:, :, 0], mask=src_mask)
-            l_mean_tgt, _ = cv2.meanStdDev(tgt_lab[:, :, 0], mask=tgt_mask)
-            delta = l_mean_tgt[0][0] - l_mean_src[0][0]
-            l = src_lab[:, :, 0] + delta
-            a = src_lab[:, :, 1]
-            b = src_lab[:, :, 2]
+        elif algo_idx == 5:
+            # 明暗別: 暗部/中間/明部で別々に統計を取り、元画像Lに応じてなめらかに合成する。
+            ranges = [
+                (0, 95, 42.0),
+                (80, 185, 128.0),
+                (160, 255, 213.0),
+            ]
+            weight_width = 95.0
+            weight_sum = np.zeros(src_lab.shape[:2], dtype="float32") + 1e-5
+            l = np.zeros(src_lab.shape[:2], dtype="float32")
+            a = np.zeros(src_lab.shape[:2], dtype="float32")
+            b = np.zeros(src_lab.shape[:2], dtype="float32")
 
-        # cv2.merge はチャンネル配列のサイズ・型・連続性にかなり厳しい。
-        # 特に「明るさだけ合わせる」では a/b がスライスビューのままになり、
-        # 環境によって Assertion failed が出るため、ここで必ず揃える。
+            for low, high, center in ranges:
+                src_l_range = ((src_lab[:, :, 0] >= low) & (src_lab[:, :, 0] <= high)).astype("uint8")
+                tgt_l_range = ((tgt_lab[:, :, 0] >= low) & (tgt_lab[:, :, 0] <= high)).astype("uint8")
+                s_mask = cv2.bitwise_and(src_mask, src_l_range)
+                t_mask = cv2.bitwise_and(tgt_mask, tgt_l_range)
+
+                if cv2.countNonZero(s_mask) < 10:
+                    s_mask = src_mask
+                if cv2.countNonZero(t_mask) < 10:
+                    t_mask = tgt_mask
+
+                part_l, part_a, part_b = transfer_lab_by_stats(src_lab, tgt_lab, s_mask, t_mask, keep_l=False)
+                weight = np.maximum(0.0, 1.0 - np.abs(src_lab[:, :, 0] - center) / weight_width).astype("float32")
+
+                l += part_l * weight
+                a += part_a * weight
+                b += part_b * weight
+                weight_sum += weight
+
+            l /= weight_sum
+            a /= weight_sum
+            b /= weight_sum
+
+        else:
+            return source
+
         l = np.ascontiguousarray(np.clip(l, 0, 255).astype("float32"))
         a = np.ascontiguousarray(np.clip(a, 0, 255).astype("float32"))
         b = np.ascontiguousarray(np.clip(b, 0, 255).astype("float32"))
@@ -1185,7 +1276,9 @@ class ImageCompositor(QMainWindow):
             "2. 白黒除外 (輝度マスク)",
             "3. 主要色抽出 (K-Means)",
             "4. ヒストグラムマッチング",
-            "5. 明るさだけ合わせる",
+            "5. 明度保持 (色味のみ)",
+            "6. 明暗別マッチング",
+            "7. 安定補正 (外れ値除外)",
         ])
         self.color_algo_combo.setCurrentIndex(1)
         self.color_algo_combo.currentIndexChanged.connect(self.controls_to_item)
