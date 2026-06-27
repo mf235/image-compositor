@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
-APP_REV = "v28"
+APP_REV = "v29"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -1359,6 +1359,7 @@ class WarpEditorCanvas(QWidget):
         self.setMouseTracking(True)
         self.display_rect = QRect()
         self.drag_index = None
+        self.focus_index = None
         self.dragging_item = False
         self.drag_last_image_pos = None
         self.panning = False
@@ -1511,33 +1512,41 @@ class WarpEditorCanvas(QWidget):
             vp = self.image_to_view(p) if p is not None else None
             view_points.append(vp)
 
-        pen_line = QPen(QColor(80, 210, 255), 1, Qt.SolidLine)
-        painter.setPen(pen_line)
-        for r in range(WARP_GRID_ROWS):
-            for c in range(WARP_GRID_COLS - 1):
-                a = view_points[r * WARP_GRID_COLS + c]
-                b = view_points[r * WARP_GRID_COLS + c + 1]
-                if a is not None and b is not None:
-                    painter.drawLine(a, b)
-        for c in range(WARP_GRID_COLS):
-            for r in range(WARP_GRID_ROWS - 1):
-                a = view_points[r * WARP_GRID_COLS + c]
-                b = view_points[(r + 1) * WARP_GRID_COLS + c]
-                if a is not None and b is not None:
-                    painter.drawLine(a, b)
+        if self.dialog.show_warp_lines:
+            pen_line = QPen(QColor(80, 210, 255), 1, Qt.SolidLine)
+            painter.setPen(pen_line)
+            for r in range(WARP_GRID_ROWS):
+                for c in range(WARP_GRID_COLS - 1):
+                    a = view_points[r * WARP_GRID_COLS + c]
+                    b = view_points[r * WARP_GRID_COLS + c + 1]
+                    if a is not None and b is not None:
+                        painter.drawLine(a, b)
+            for c in range(WARP_GRID_COLS):
+                for r in range(WARP_GRID_ROWS - 1):
+                    a = view_points[r * WARP_GRID_COLS + c]
+                    b = view_points[(r + 1) * WARP_GRID_COLS + c]
+                    if a is not None and b is not None:
+                        painter.drawLine(a, b)
 
-        for idx, vp in enumerate(view_points):
-            if vp is None:
-                continue
-            selected = idx == self.drag_index
-            radius = 4 if selected else 3
-            color = QColor(255, 230, 80) if selected else QColor(80, 210, 255)
-            painter.setPen(QPen(QColor(15, 15, 15), 1))
-            painter.setBrush(color)
-            painter.drawEllipse(vp, radius, radius)
+        if self.dialog.show_warp_points:
+            for idx, vp in enumerate(view_points):
+                if vp is None:
+                    continue
+                is_drag = idx == self.drag_index
+                is_focus = idx == self.focus_index and self.drag_index is None
+                radius = 4 if (is_drag or is_focus) else 3
+                if is_drag:
+                    color = QColor(255, 230, 80)
+                elif is_focus:
+                    color = QColor(255, 150, 70)
+                else:
+                    color = QColor(80, 210, 255)
+                painter.setPen(QPen(QColor(15, 15, 15), 1))
+                painter.setBrush(color)
+                painter.drawEllipse(vp, radius, radius)
 
         painter.setPen(QColor(230, 230, 230))
-        painter.drawText(10, self.height() - 12, "点:左ドラッグ / 線の内側:素材移動 / 空白左ドラッグ:表示移動 / ホイール:拡大縮小 / R:リセット / Enter:適用 / Esc:キャンセル")
+        painter.drawText(10, self.height() - 12, "点:左ドラッグ / 線の内側:素材移動 / 空白左ドラッグ:表示移動 / TAB:線+点 表示切替 / ホイール:拡大縮小 / R:リセット / Enter:適用 / Esc:キャンセル")
 
     def nearest_control_point(self, pos):
         best_idx = None
@@ -1568,6 +1577,7 @@ class WarpEditorCanvas(QWidget):
         if event.button() == Qt.LeftButton:
             idx = self.nearest_control_point(event.pos())
             if idx is not None:
+                self.focus_index = idx
                 self.drag_index = idx
                 self.dialog.set_dragged_point_from_image(idx, self.view_to_image(event.pos()))
                 self.update()
@@ -1593,10 +1603,12 @@ class WarpEditorCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         if self.drag_index is not None:
+            self.focus_index = self.drag_index
             self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
             self.update()
             event.accept()
             return
+        self.focus_index = self.nearest_control_point(event.pos())
         if self.dragging_item:
             image_pos = self.view_to_image(event.pos())
             if image_pos is not None and self.drag_last_image_pos is not None:
@@ -1624,6 +1636,7 @@ class WarpEditorCanvas(QWidget):
     def mouseReleaseEvent(self, event):
         if self.drag_index is not None:
             self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
+            self.focus_index = self.drag_index
             self.drag_index = None
             self.update()
             event.accept()
@@ -1644,6 +1657,10 @@ class WarpEditorCanvas(QWidget):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Tab:
+            self.dialog.toggle_warp_overlay_by_tab()
+            event.accept()
+            return
         if event.key() == Qt.Key_R:
             self.dialog.reset_points()
             event.accept()
@@ -1669,6 +1686,8 @@ class WarpDialog(QDialog):
         self.points = get_item_warp_points(self.item()).copy()
         self.draft_x = float(self.item().get("x", 0.0))
         self.draft_y = float(self.item().get("y", 0.0))
+        self.show_warp_lines = True
+        self.show_warp_points = True
         self._preview_cache = None
         self._preview_cache_key = None
 
@@ -1677,17 +1696,57 @@ class WarpDialog(QDialog):
         layout.addWidget(self.canvas, 1)
 
         button_row = QHBoxLayout()
+        toggle_style = "QPushButton:checked { background-color: #3f7cff; color: white; border: 1px solid #2f58b8; }"
+        self.lines_toggle_btn = QPushButton("線")
+        self.lines_toggle_btn.setCheckable(True)
+        self.lines_toggle_btn.setStyleSheet(toggle_style)
+        self.lines_toggle_btn.setFocusPolicy(Qt.NoFocus)
+        self.lines_toggle_btn.toggled.connect(self.on_lines_toggled)
+        self.points_toggle_btn = QPushButton("点")
+        self.points_toggle_btn.setCheckable(True)
+        self.points_toggle_btn.setStyleSheet(toggle_style)
+        self.points_toggle_btn.setFocusPolicy(Qt.NoFocus)
+        self.points_toggle_btn.toggled.connect(self.on_points_toggled)
         self.reset_btn = QPushButton("リセット")
+        self.reset_btn.setFocusPolicy(Qt.NoFocus)
         self.reset_btn.clicked.connect(self.reset_points)
         self.apply_btn = QPushButton("適用")
+        self.apply_btn.setFocusPolicy(Qt.NoFocus)
         self.apply_btn.clicked.connect(self.accept)
         self.cancel_btn = QPushButton("キャンセル")
+        self.cancel_btn.setFocusPolicy(Qt.NoFocus)
         self.cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(self.lines_toggle_btn)
+        button_row.addWidget(self.points_toggle_btn)
         button_row.addWidget(self.reset_btn)
         button_row.addStretch(1)
         button_row.addWidget(self.apply_btn)
         button_row.addWidget(self.cancel_btn)
         layout.addLayout(button_row)
+        self.sync_overlay_buttons()
+
+    def sync_overlay_buttons(self):
+        self.lines_toggle_btn.blockSignals(True)
+        self.points_toggle_btn.blockSignals(True)
+        self.lines_toggle_btn.setChecked(bool(self.show_warp_lines))
+        self.points_toggle_btn.setChecked(bool(self.show_warp_points))
+        self.lines_toggle_btn.blockSignals(False)
+        self.points_toggle_btn.blockSignals(False)
+        self.canvas.update()
+
+    def on_lines_toggled(self, checked):
+        self.show_warp_lines = bool(checked)
+        self.sync_overlay_buttons()
+
+    def on_points_toggled(self, checked):
+        self.show_warp_points = bool(checked)
+        self.sync_overlay_buttons()
+
+    def toggle_warp_overlay_by_tab(self):
+        visible = bool(self.show_warp_lines or self.show_warp_points)
+        self.show_warp_lines = not visible
+        self.show_warp_points = not visible
+        self.sync_overlay_buttons()
 
     def item(self):
         return self.main_window.items[self.item_index]
