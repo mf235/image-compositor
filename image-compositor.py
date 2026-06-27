@@ -7,6 +7,8 @@ image-compositor.py
 
 必要ライブラリ:
     pip install PyQt5 opencv-python numpy
+
+# v24: loupe close uses standard QWidget close; resize paths use cv2.INTER_CUBIC.
 """
 
 import json
@@ -818,7 +820,7 @@ class LoupeView(QWidget):
 
 class LoupeToolWindow(QWidget):
     def __init__(self, main_window):
-        super().__init__(main_window, Qt.Tool | Qt.WindowTitleHint)
+        super().__init__(main_window, Qt.Tool | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         self.main_window = main_window
         self.setWindowTitle("ルーペ")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -861,12 +863,9 @@ class LoupeToolWindow(QWidget):
             self.main_window.sync_view_buttons(save=save)
 
     def closeEvent(self, event):
-        # ×で閉じた時はルーペを非表示にして、表示状態を保存する。
-        event.accept()
-        self.hide()
-        if hasattr(self.main_window, "sync_view_buttons"):
-            save = not getattr(self.main_window, "loading_ui", False) and not getattr(self.main_window, "_closing_app", False)
-            self.main_window.sync_view_buttons(save=save)
+        # 標準の close 挙動に任せる。WA_DeleteOnClose=False なので破棄されず非表示になる。
+        # 表示状態の保存は hideEvent 側で行う。
+        super().closeEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
