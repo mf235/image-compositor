@@ -1061,7 +1061,8 @@ class CanvasWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.fillRect(self.rect(), QColor(32, 32, 32))
 
         image = self.current_canvas_image()
@@ -1464,7 +1465,8 @@ class WarpEditorCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.fillRect(self.rect(), QColor(32, 32, 32))
 
         img = self.dialog.preview_image()
