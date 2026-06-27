@@ -272,8 +272,8 @@ def resize_image(src_bgra, scale_w: float, scale_h: float = None):
     h, w = img.shape[:2]
     nw = max(1, int(round(w * scale_w)))
     nh = max(1, int(round(h * scale_h)))
-    interp = cv2.INTER_AREA if scale_w < 1.0 or scale_h < 1.0 else cv2.INTER_CUBIC
-    return cv2.resize(img, (nw, nh), interpolation=interp)
+    # 画質優先。縮小・拡大とも Bicubic に統一する。
+    return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
 
 
 def rotate_image(src_bgra, angle_degrees: float):
@@ -861,7 +861,12 @@ class LoupeToolWindow(QWidget):
             self.main_window.sync_view_buttons(save=save)
 
     def closeEvent(self, event):
-        super().closeEvent(event)
+        # ×で閉じた時はルーペを非表示にして、表示状態を保存する。
+        event.accept()
+        self.hide()
+        if hasattr(self.main_window, "sync_view_buttons"):
+            save = not getattr(self.main_window, "loading_ui", False) and not getattr(self.main_window, "_closing_app", False)
+            self.main_window.sync_view_buttons(save=save)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2582,7 +2587,7 @@ class ImageCompositor(QMainWindow):
         scale = min(76 / max(w, 1), 76 / max(h, 1))
         nw = max(1, int(w * scale))
         nh = max(1, int(h * scale))
-        thumb = cv2.resize(bgra, (nw, nh), interpolation=cv2.INTER_AREA)
+        thumb = cv2.resize(bgra, (nw, nh), interpolation=cv2.INTER_CUBIC)
         x = (80 - nw) // 2
         y = (80 - nh) // 2
         alpha_composite_bgra(canvas, thumb, x, y)
