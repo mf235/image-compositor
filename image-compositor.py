@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
-APP_REV = "v31"
+APP_REV = "v32"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -752,16 +752,6 @@ class LoupeView(QWidget):
 
     def sizeHint(self):
         return QSize(220, 160)
-
-    def image_point_to_view_fast(self, p, scale=None):
-        if p is None or self.center is None:
-            return None
-        if scale is None:
-            scale = self.get_current_scale()
-        return QPointF(
-            self.width() / 2.0 + (p.x() - self.center.x()) * scale,
-            self.height() / 2.0 + (p.y() - self.center.y()) * scale,
-        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1463,6 +1453,16 @@ class WarpEditorCanvas(QWidget):
         if ix < 0 or iy < 0 or ix >= w or iy >= h:
             return None
         return QPointF(ix, iy)
+
+    def image_point_to_view_fast(self, p, scale=None):
+        if p is None or self.center is None:
+            return None
+        if scale is None:
+            scale = self.get_current_scale()
+        return QPointF(
+            self.width() / 2.0 + (p.x() - self.center.x()) * scale,
+            self.height() / 2.0 + (p.y() - self.center.y()) * scale,
+        )
 
     def set_zoom(self, new_zoom_scale, anchor_pos=None):
         shape = self.preview_shape()
