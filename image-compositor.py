@@ -53,6 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
+APP_REV = "v26"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -128,6 +129,15 @@ def image_files_from_urls(mime_data):
 def image_file_from_urls(mime_data):
     paths = image_files_from_urls(mime_data)
     return paths[0] if paths else None
+
+def project_file_from_urls(mime_data):
+    if not mime_data.hasUrls():
+        return None
+    for url in mime_data.urls():
+        path = url.toLocalFile()
+        if path and Path(path).suffix.lower() == ".json":
+            return path
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -1032,13 +1042,13 @@ class CanvasWidget(QWidget):
         self.invalidate_background_cache()
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasFormat(PART_MIME) or image_file_from_urls(event.mimeData()):
+        if event.mimeData().hasFormat(PART_MIME) or image_file_from_urls(event.mimeData()) or project_file_from_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasFormat(PART_MIME) or image_file_from_urls(event.mimeData()):
+        if event.mimeData().hasFormat(PART_MIME) or image_file_from_urls(event.mimeData()) or project_file_from_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -1050,6 +1060,12 @@ class CanvasWidget(QWidget):
             if pos is not None:
                 self.main_window.place_part(part_id, pos.x(), pos.y())
                 event.acceptProposedAction()
+            return
+
+        project_path = project_file_from_urls(event.mimeData())
+        if project_path:
+            self.main_window.load_project(project_path)
+            event.acceptProposedAction()
             return
 
         path = image_file_from_urls(event.mimeData())
@@ -1343,6 +1359,8 @@ class WarpEditorCanvas(QWidget):
         self.setMouseTracking(True)
         self.display_rect = QRect()
         self.drag_index = None
+        self.dragging_item = False
+        self.drag_last_image_pos = None
         self.panning = False
         self.pan_last_pos = None
         self.zoom_scale = 1.0
@@ -1519,7 +1537,7 @@ class WarpEditorCanvas(QWidget):
             painter.drawEllipse(vp, radius, radius)
 
         painter.setPen(QColor(230, 230, 230))
-        painter.drawText(10, self.height() - 12, "制御点をドラッグ / ホイール:拡大縮小 / 空白ドラッグ:表示移動 / R:リセット / Enter:適用 / Esc:キャンセル")
+        painter.drawText(10, self.height() - 12, "点:左ドラッグ / 素材移動:左ドラッグ / 表示移動:右ドラッグ / ホイール:拡大縮小 / R:リセット / Enter:適用 / Esc:キャンセル")
 
     def nearest_control_point(self, pos):
         best_idx = None
@@ -1555,6 +1573,14 @@ class WarpEditorCanvas(QWidget):
                 self.update()
                 event.accept()
                 return
+            image_pos = self.view_to_image(event.pos())
+            if self.dialog.point_hits_item(image_pos):
+                self.dragging_item = True
+                self.drag_last_image_pos = image_pos
+                self.setCursor(Qt.SizeAllCursor)
+                event.accept()
+                return
+        if event.button() == Qt.RightButton:
             self.panning = True
             self.pan_last_pos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
@@ -1566,6 +1592,16 @@ class WarpEditorCanvas(QWidget):
         if self.drag_index is not None:
             self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
             self.update()
+            event.accept()
+            return
+        if self.dragging_item:
+            image_pos = self.view_to_image(event.pos())
+            if image_pos is not None and self.drag_last_image_pos is not None:
+                dx = image_pos.x() - self.drag_last_image_pos.x()
+                dy = image_pos.y() - self.drag_last_image_pos.y()
+                self.dialog.move_item_by_image_delta(dx, dy)
+                self.drag_last_image_pos = image_pos
+                self.update()
             event.accept()
             return
         if self.panning and self.pan_last_pos is not None and self.center is not None:
@@ -1586,6 +1622,13 @@ class WarpEditorCanvas(QWidget):
         if self.drag_index is not None:
             self.dialog.set_dragged_point_from_image(self.drag_index, self.view_to_image(event.pos()))
             self.drag_index = None
+            self.update()
+            event.accept()
+            return
+        if self.dragging_item:
+            self.dragging_item = False
+            self.drag_last_image_pos = None
+            self.unsetCursor()
             self.update()
             event.accept()
             return
@@ -1621,6 +1664,8 @@ class WarpDialog(QDialog):
         self.setWindowTitle("ワープ編集")
         self.resize(980, 720)
         self.points = get_item_warp_points(self.item()).copy()
+        self.draft_x = float(self.item().get("x", 0.0))
+        self.draft_y = float(self.item().get("y", 0.0))
         self._preview_cache = None
         self._preview_cache_key = None
 
@@ -1646,6 +1691,8 @@ class WarpDialog(QDialog):
 
     def draft_item(self):
         draft = dict(self.item())
+        draft["x"] = float(self.draft_x)
+        draft["y"] = float(self.draft_y)
         draft["warp_enabled"] = True
         draft["warp_grid_rows"] = WARP_GRID_ROWS
         draft["warp_grid_cols"] = WARP_GRID_COLS
@@ -1665,7 +1712,7 @@ class WarpDialog(QDialog):
         base = self.main_window.base_image
         if base is None:
             return None
-        key = tuple((round(x, 4), round(y, 4)) for x, y in self.points)
+        key = (round(float(self.draft_x), 3), round(float(self.draft_y), 3), tuple((round(x, 4), round(y, 4)) for x, y in self.points))
         if self._preview_cache is not None and key == self._preview_cache_key:
             return self._preview_cache
         canvas = base.copy()
@@ -1725,8 +1772,32 @@ class WarpDialog(QDialog):
         self.points[idx] = [float(nx), float(ny)]
         self.invalidate_preview()
 
+    def outer_polygon_image(self):
+        corners = []
+        for idx in (0, WARP_GRID_COLS - 1, WARP_GRID_ROWS * WARP_GRID_COLS - 1, WARP_GRID_COLS * (WARP_GRID_ROWS - 1)):
+            p = self.control_point_image_pos(idx)
+            if p is None:
+                return None
+            corners.append(p)
+        return QPolygonF(corners)
+
+    def point_hits_item(self, image_pos):
+        if image_pos is None:
+            return False
+        poly = self.outer_polygon_image()
+        if poly is None:
+            return False
+        return poly.containsPoint(QPointF(image_pos), Qt.OddEvenFill)
+
+    def move_item_by_image_delta(self, dx, dy):
+        self.draft_x += float(dx)
+        self.draft_y += float(dy)
+        self.invalidate_preview()
+
     def accept(self):
         item = self.item()
+        item["x"] = float(self.draft_x)
+        item["y"] = float(self.draft_y)
         item["warp_enabled"] = True
         item["warp_grid_rows"] = WARP_GRID_ROWS
         item["warp_grid_cols"] = WARP_GRID_COLS
@@ -1743,7 +1814,7 @@ class WarpDialog(QDialog):
 class ImageCompositor(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} {APP_REV}")
         self.setAcceptDrops(True)
         self.setStyleSheet("QGroupBox { font-weight: bold; } QGroupBox::title { font-weight: bold; subcontrol-origin: margin; left: 8px; padding: 0 2px 0 2px; }")
 
@@ -2173,18 +2244,24 @@ class ImageCompositor(QMainWindow):
             self.save_settings()
 
     def dragEnterEvent(self, event):
-        if image_files_from_urls(event.mimeData()):
+        if image_files_from_urls(event.mimeData()) or project_file_from_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
-        if image_files_from_urls(event.mimeData()):
+        if image_files_from_urls(event.mimeData()) or project_file_from_urls(event.mimeData()):
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
 
     def dropEvent(self, event):
+        project_path = project_file_from_urls(event.mimeData())
+        if project_path:
+            self.load_project(project_path)
+            event.acceptProposedAction()
+            return
+
         paths = image_files_from_urls(event.mimeData())
         if not paths:
             super().dropEvent(event)
@@ -3120,7 +3197,7 @@ class ImageCompositor(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
+    app.setApplicationName(f"{APP_NAME} {APP_REV}")
     w = ImageCompositor()
     w.show()
     sys.exit(app.exec_())
