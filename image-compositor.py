@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
-APP_REV = "v27"
+APP_REV = "v28"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -1537,7 +1537,7 @@ class WarpEditorCanvas(QWidget):
             painter.drawEllipse(vp, radius, radius)
 
         painter.setPen(QColor(230, 230, 230))
-        painter.drawText(10, self.height() - 12, "点:左ドラッグ / 線の内側:左ドラッグで素材移動 / 右ドラッグ:表示移動 / ホイール:拡大縮小 / R:リセット / Enter:適用 / Esc:キャンセル")
+        painter.drawText(10, self.height() - 12, "点:左ドラッグ / 線の内側:素材移動 / 空白左ドラッグ:表示移動 / ホイール:拡大縮小 / R:リセット / Enter:適用 / Esc:キャンセル")
 
     def nearest_control_point(self, pos):
         best_idx = None
@@ -1573,6 +1573,7 @@ class WarpEditorCanvas(QWidget):
                 self.update()
                 event.accept()
                 return
+
             image_pos = self.view_to_image(event.pos())
             if self.dialog.point_hits_item(image_pos):
                 self.dragging_item = True
@@ -1580,12 +1581,14 @@ class WarpEditorCanvas(QWidget):
                 self.setCursor(Qt.SizeAllCursor)
                 event.accept()
                 return
-        if event.button() == Qt.RightButton:
+
+            # メイン画面と同じく、空白の左ドラッグで表示範囲を移動する。
             self.panning = True
             self.pan_last_pos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
