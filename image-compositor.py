@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 
 APP_NAME = "画像合成ツール"
-APP_REV = "v33"
+APP_REV = "v34"
 SETTINGS_FILE = "image-compositor-settings.json"
 PARTS_DIR = "_parts"
 DEFAULT_PARTS_FOLDER = "default"
@@ -1978,6 +1978,7 @@ class ImageCompositor(QMainWindow):
         self.parts_dir.mkdir(parents=True, exist_ok=True)
 
         self.base_image_path = None
+        self.current_project_path = None
         self.base_image = None
         self.preview_image = None
         self.parts = []
@@ -2563,6 +2564,7 @@ class ImageCompositor(QMainWindow):
         self.items = []
         self.selected_index = None
         self.base_image_path = None
+        self.current_project_path = None
         self.base_image = None
         self.preview_image = None
         self.sync_view_buttons(save=False)
@@ -2616,12 +2618,14 @@ class ImageCompositor(QMainWindow):
         if paths:
             self.add_part_files(paths)
 
-    def load_base_image(self, path, save=True):
+    def load_base_image(self, path, save=True, reset_project_path=True):
         img = imread_japanese(path)
         if img is None:
             QMessageBox.warning(self, "読み込み失敗", "元画像を読み込めませんでした。")
             return
         self.base_image_path = path
+        if reset_project_path:
+            self.current_project_path = None
         self.base_image = ensure_bgra(img)
         if hasattr(self, "canvas"):
             self.canvas.reset_view()
@@ -2735,19 +2739,25 @@ class ImageCompositor(QMainWindow):
             self.save_settings()
             self.statusBar().showMessage(f"_parts/{self.current_parts_folder} に素材を追加: {added}個")
 
+    def default_project_save_path(self):
+        if self.current_project_path:
+            return str(Path(self.current_project_path))
+        default_dir = Path(self.base_image_path).parent if self.base_image_path else script_dir()
+        if self.base_image_path:
+            p = Path(self.base_image_path)
+            default_name = f"{p.stem}.icp.json"
+        else:
+            default_name = "project.icp.json"
+        return str(default_dir / default_name)
+
     def save_project_dialog(self):
         if self.base_image is None:
             QMessageBox.warning(self, "保存不可", "元画像がありません。")
             return
-        default_dir = str(Path(self.base_image_path).parent) if self.base_image_path else str(script_dir())
-        default_name = "project.icp.json"
-        if self.base_image_path:
-            p = Path(self.base_image_path)
-            default_name = f"{p.stem}.icp.json"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "プロジェクトを保存",
-            str(Path(default_dir) / default_name),
+            self.default_project_save_path(),
             "Image Compositor Project (*.json)",
         )
         if not path:
@@ -2762,15 +2772,17 @@ class ImageCompositor(QMainWindow):
         }
         try:
             Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.current_project_path = str(Path(path))
             self.statusBar().showMessage(f"プロジェクト保存: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "保存失敗", f"プロジェクト保存に失敗しました。\n{exc}")
 
     def open_project_dialog(self):
+        start_dir = str(Path(self.current_project_path).parent) if self.current_project_path else ""
         path, _ = QFileDialog.getOpenFileName(
             self,
             "プロジェクトを開く",
-            "",
+            start_dir,
             "Image Compositor Project (*.json)",
         )
         if path:
@@ -2792,7 +2804,8 @@ class ImageCompositor(QMainWindow):
         self.set_current_parts_folder(folder, save=False)
         self.items = data.get("items", []) or []
         self.selected_index = 0 if self.items else None
-        self.load_base_image(base_path, save=False)
+        self.current_project_path = str(Path(path))
+        self.load_base_image(base_path, save=False, reset_project_path=False)
         self.refresh_placed_list()
         self.refresh_preview(save=False)
         self.save_settings()
